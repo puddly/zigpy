@@ -16,7 +16,7 @@ class ControllerApplication(zigpy.util.ListenableMixin):
     def __init__(self, database_file=None):
         self._send_sequence = 0
         self.devices = {}
-        self._listeners = {}
+        self._listeners = []
         self._ieee = None
         self._nwk = None
 

@@ -15,7 +15,7 @@ class ZDO(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
     """The ZDO endpoint of a device"""
     def __init__(self, device):
         self._device = device
-        self._listeners = {}
+        self._listeners = []
 
     def _serialize(self, command, *args):
         sequence = self._device.application.get_sequence()

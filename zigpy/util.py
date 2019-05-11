@@ -12,11 +12,7 @@ LOGGER = logging.getLogger(__name__)
 
 class ListenableMixin:
     def _add_listener(self, listener, include_context):
-        id_ = id(listener)
-        while id_ in self._listeners:
-            id_ += 1
-        self._listeners[id_] = (listener, include_context)
-        return id_
+        self._listeners.append((listener, include_context))
 
     def add_listener(self, listener):
         return self._add_listener(listener, include_context=False)
@@ -24,8 +20,14 @@ class ListenableMixin:
     def add_context_listener(self, listener):
         return self._add_listener(listener, include_context=True)
 
+    def remove_listener(self, listener):
+        self._listeners.remove((listener, False))
+
+    def remove_context_listener(self, listener):
+        self._listeners.remove((listener, True))
+
     def listener_event(self, method_name, *args):
-        for listener, include_context in self._listeners.values():
+        for listener, include_context in self._listeners:
             method = getattr(listener, method_name, None)
 
             if not method:

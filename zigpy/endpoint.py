@@ -27,7 +27,7 @@ class Endpoint(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         self.out_clusters = {}
         self._cluster_attr = {}
         self.status = Status.NEW
-        self._listeners = {}
+        self._listeners = []
         self.profile_id = None
         self.manufacturer = None
         self.model = None

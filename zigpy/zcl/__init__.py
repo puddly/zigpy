@@ -48,7 +48,7 @@ class Cluster(util.ListenableMixin, util.LocalLogMixin, metaclass=Registry):
     def __init__(self, endpoint):
         self._endpoint = endpoint
         self._attr_cache = {}
-        self._listeners = {}
+        self._listeners = []
 
     @classmethod
     def from_id(cls, endpoint, cluster_id):

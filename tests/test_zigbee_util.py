@@ -7,7 +7,7 @@ from zigpy import util
 
 class Listenable(util.ListenableMixin):
     def __init__(self):
-        self._listeners = {}
+        self._listeners = []
 
 
 def test_listenable():

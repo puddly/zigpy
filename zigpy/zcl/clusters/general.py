@@ -712,14 +712,13 @@ class Ota(Cluster):
         frmw = self.endpoint.device.application.ota.get_firmware(
             manufacturer_id, image_type)
 
-        if frmw and frmw.is_valid:
+        if frmw:
             update_needed = frmw.upgradeable(
                 manufacturer_id, image_type, current_file_version,
                 hardware_version)
             self.debug("Firmware version: %s, size: %s. Update needed: %s",
                        frmw.version, frmw.size, update_needed)
-            if frmw.upgradeable(manufacturer_id, image_type,
-                                current_file_version, hardware_version):
+            if update_needed:
                 self.info("Updating: %s %s",
                           self.endpoint.manufacturer, self.endpoint.model)
                 await self.query_next_image_response(

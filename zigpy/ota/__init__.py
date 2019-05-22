@@ -45,11 +45,10 @@ class OTA(zigpy.util.ListenableMixin):
             return self._firmwares[key]
 
         frmws = self.listener_event('get_firmware', key)
-        frmws = {f.version: f for f in frmws if f and f.is_valid}
         if not frmws:
             return None
 
-        latest_firmware = frmws[max(frmws)]
+        latest_firmware = max(frmws, key=lambda f: f.version)
         self._firmwares[key] = latest_firmware
         return latest_firmware
 

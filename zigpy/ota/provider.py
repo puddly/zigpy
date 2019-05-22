@@ -7,14 +7,13 @@ from typing import Optional
 
 import aiohttp
 
-from zigpy.ota.firmware import Firmware, FirmwareKey
+from zigpy.ota.firmware import Firmware, FirmwareKey, OTAImage
 
 LOGGER = logging.getLogger(__name__)
 
 
 class Trådfri:
     UPDATE_URL = 'https://fw.ota.homesmart.ikea.net/feed/version_info.json'
-    OTA_HEADER = 0x0BEEF11E.to_bytes(4, 'little')
     MANUFACTURER_ID = 4476
 
     def __init__(self):
@@ -52,10 +51,17 @@ class Trådfri:
             async with aiohttp.ClientSession() as req:
                 LOGGER.debug("Downloading %s for %s", frm.url, key)
                 async with req.get(frm.url) as rsp:
-                    data = await rsp.read()
-        offset = data.index(self.OTA_HEADER)
-        frm.data = data[offset:offset + frm.size]
-        assert len(frm.data) == frm.size
+                    ikea_ota = await rsp.read()
+
+        assert len(ikea_ota) > 24
+        offset = int.from_bytes(ikea_ota[16:20], 'little')
+        size = int.from_bytes(ikea_ota[20:24], 'little')
+        assert len(ikea_ota) > offset + size
+
+        frm.image = OTAImage.deserialize(ikea_ota[offset:offset + size])
+        assert frm.version == key.version
+        assert frm.image.manufacturer_id == key.image.manufacturer_id
+
         self._cache[key] = frm
         LOGGER.debug("Finished downloading %s bytes from %s",
                      frm.size, frm.url)
@@ -65,9 +71,7 @@ class Trådfri:
             return None
 
         try:
-            frm = self._cache[key]
-            if frm.is_valid:
-                return frm
+            return self._cache[key]
         except KeyError:
             pass
 

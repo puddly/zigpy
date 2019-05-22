@@ -1,4 +1,4 @@
-"""Implement OTA for Zigbee devices."""
+"""OTA support for Zigbee devices."""
 
 import asyncio
 import logging

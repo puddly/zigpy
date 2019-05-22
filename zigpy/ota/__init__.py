@@ -1,5 +1,4 @@
 """OTA support for Zigbee devices."""
-
 import asyncio
 import logging
 from typing import Optional

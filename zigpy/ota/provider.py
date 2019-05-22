@@ -1,5 +1,4 @@
-"""Implement OTA for Zigbee devices."""
-
+"""OTA Firmware providers."""
 import asyncio
 import logging
 from collections import defaultdict

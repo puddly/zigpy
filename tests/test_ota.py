@@ -8,14 +8,32 @@ import zigpy.ota
 import zigpy.ota.firmware
 import zigpy.ota.provider
 
-MANUFACTURER_ID = mock.sentinel.manufacturer_id
-IMAGE_TYPE = mock.sentinel.image_type
+MANUFACTURER_ID = 0x0001
+IMAGE_TYPE = 0x1111
 
 
 @pytest.fixture
-def firmware(key):
-    data = b'abcdef'
-    return zigpy.ota.firmware.Firmware(key, 100, len(data), '', data)
+def ota_image(key):
+    image = zigpy.ota.firmware.OTAImage()
+    image.ota_header_control_field = 0x0000
+    image.manufacturer_code = key.manufacturer_id
+    image.image_type = key.image_type
+    image.file_version = 0x1111
+    image.zigbee_stack_version = 0x2222
+    image.ota_header_string = b'test' * 8
+    image.security_credential_version = None
+    image.upgrade_file_destination = None
+    image.minimum_hardware_version = None
+    image.maximum_hardare_version = None
+    image.unknown_optional_fields = None
+    image.subelements = [zigpy.ota.firmware.OTAImageSubElement(0x3333, b'TEST')]
+
+    return image
+
+
+@pytest.fixture
+def firmware(key, ota_image):
+    return zigpy.ota.firmware.Firmware(key, 'http://example.org/', ota_image)
 
 
 @pytest.fixture
@@ -79,10 +97,9 @@ def test_get_firmware_empty(ota, firmware, key):
     assert ota.listener_event.call_args[0][1] == key
 
 
-def test_get_firmware_new(ota, firmware, key):
-    new_data = b'new_firmware_2'
-    newer = zigpy.ota.firmware.Firmware(key, firmware.version + 1,
-                                        len(new_data), '', new_data)
+def test_get_firmware_new(ota, firmware, key, ota_image):
+    ota_image.file_version += 1
+    newer = zigpy.ota.firmware.Firmware(key, 'http://example.org/', ota_image)
 
     handler_mock = mock.MagicMock(return_value=[None, firmware, newer])
     ota.listener_event = mock.MagicMock(side_effect=handler_mock)

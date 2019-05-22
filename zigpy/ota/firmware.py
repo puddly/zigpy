@@ -26,11 +26,12 @@ class Firmware:
         if self.image.file_version <= ver:
             return False
 
-        if self.image.minimum_hardware_version is not None and self.image.minimum_hardware_version > hw_ver:
-            return False
+        if hw_ver is not None:
+            if self.image.minimum_hardware_version is not None and self.image.minimum_hardware_version > hw_ver:
+                return False
 
-        if self.image.maximum_hardware_version is not None and self.image.maximum_hardware_version < hw_ver:
-            return False
+            if self.image.maximum_hardware_version is not None and self.image.maximum_hardware_version < hw_ver:
+                return False
 
         return True
 
@@ -50,12 +51,12 @@ class OTAImageSubElement:
 
     def serialize(self):
         return t.uint16_t(self.tag_id).serialize() \
-             + t.uint32_t(len(self.data)).serialize() \
-             + self.data
+            + t.uint32_t(len(self.data)).serialize() \
+            + self.data
 
     @property
     def size(self):
-        return 2 + len(data)
+        return 2 + 4 + len(self.data)
 
     @classmethod
     def deserialize(cls, data):
@@ -79,24 +80,28 @@ class OTAImage:
     security_credential_version = attr.ib(default=None)
     upgrade_file_destination = attr.ib(default=None)
     minimum_hardware_version = attr.ib(default=None)
-    maximum_hardare_version = attr.ib(default=None)
+    maximum_hardware_version = attr.ib(default=None)
     unknown_optional_fields = attr.ib(default=None)
 
-    subelements = attr.ib(default=list)
+    subelements = attr.ib(default=attr.Factory(list))
 
     @property
-    def size(self):
-        # Minimal header and all subelements
-        total = 56 + sum(e.size for e in self.subelements)
+    def _total_header_length(self):
+        # Minimal header
+        total = 56
 
         # Add in the optional fields
         total += 1 if self.security_credential_version is not None else 0
         total += 8 if self.upgrade_file_destination is not None else 0
         total += 2 if self.minimum_hardware_version is not None else 0
-        total += 2 if self.maximum_hardare_version is not None else 0
+        total += 2 if self.maximum_hardware_version is not None else 0
         total += len(self.unknown_optional_fields or b'')
 
         return total
+
+    @property
+    def size(self):
+        return self._total_header_length + sum(e.size for e in self.subelements)
 
     @classmethod
     def deserialize(cls, data):
@@ -121,12 +126,6 @@ class OTAImage:
 
         optional_fields_length = ota_header_length - 56
 
-        security_credential_version = None
-        upgrade_file_destination = None
-        minimum_hardware_version = None
-        maximum_hardare_version = None
-        unknown_optional_fields = None
-
         if optional_fields_length >= 1:
             instance.security_credential_version, data = t.uint8_t.deserialize(data)
             optional_fields_length -= 1
@@ -140,7 +139,7 @@ class OTAImage:
             optional_fields_length -= 2
 
         if optional_fields_length >= 2:
-            instance.maximum_hardare_version, data = t.uint16_t.deserialize(data)
+            instance.maximum_hardware_version, data = t.uint16_t.deserialize(data)
             optional_fields_length -= 2
 
         if optional_fields_length > 0:
@@ -159,7 +158,7 @@ class OTAImage:
         assert num_sub_elements_bytes == 0
 
         # Final sanity check
-        assert instance.serialize() == data_copy[:len(data)]
+        assert data_copy == instance.serialize() + data
 
         return instance, data
 
@@ -167,10 +166,7 @@ class OTAImage:
         result = bytearray()
         result += t.uint32_t(0x0BEEF11E).serialize()
         result += t.uint16_t(0x0100).serialize()
-
-        # Placeholder
-        header_length_offset = len(result)
-        result += t.uint16_t(0xFFFF).serialize()
+        result += t.uint16_t(self._total_header_length).serialize()
 
         result += t.uint16_t(self.ota_header_control_field).serialize()
         result += t.uint16_t(self.manufacturer_code).serialize()
@@ -184,7 +180,7 @@ class OTAImage:
 
         # Make sure the optional fields are all set in order or not at all
         optional_fields = (self.security_credential_version, self.upgrade_file_destination,
-                           self.minimum_hardware_version, self.maximum_hardare_version)
+                           self.minimum_hardware_version, self.maximum_hardware_version)
 
         assert all(optional_fields[:sum(f is not None for f in optional_fields)])
 
@@ -197,19 +193,13 @@ class OTAImage:
         if self.minimum_hardware_version is not None:
             result += t.uint16_t(self.minimum_hardware_version).serialize()
 
-        if self.maximum_hardare_version is not None:
-            result += t.uint16_t(self.maximum_hardare_version).serialize()
+        if self.maximum_hardware_version is not None:
+            result += t.uint16_t(self.maximum_hardware_version).serialize()
 
         if self.unknown_optional_fields is not None:
             result += self.unknown_optional_fields
 
-        # We now know the header length
-        result[header_length_offset:header_length_offset + 2] = t.uint16_t(len(result)).serialize()
-
         for subelement in self.subelements:
             result += subelement.serialize()
-
-        # We now know the total image size
-        result[total_image_size_offset:total_image_size_offset + 4] = t.uint32_t(len(result)).serialize()
 
         return result

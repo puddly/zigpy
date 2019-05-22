@@ -1,4 +1,5 @@
-"""OTA support for Zigbee devices."""
+"""Implement OTA for Zigbee devices."""
+
 import asyncio
 import logging
 from typing import Optional
@@ -44,10 +45,11 @@ class OTA(zigpy.util.ListenableMixin):
             return self._firmwares[key]
 
         frmws = self.listener_event('get_firmware', key)
+        frmws = {f.version: f for f in frmws if f}
         if not frmws:
             return None
 
-        latest_firmware = max(frmws, key=lambda f: f.version)
+        latest_firmware = frmws[max(frmws)]
         self._firmwares[key] = latest_firmware
         return latest_firmware
 

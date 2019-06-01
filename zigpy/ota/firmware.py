@@ -6,7 +6,7 @@ import zigpy.types as t
 
 @attr.s(frozen=True)
 class FirmwareKey:
-    manufacturer_code = attr.ib(default=None)
+    manufacturer_id = attr.ib(default=None)
     image_type = attr.ib(default=None)
     file_version = attr.ib(default=None)
 
@@ -15,7 +15,7 @@ class FirmwareKey:
         assert key.version is not None
 
         if self.file_version is None:
-            return (self.manufacturer_code, self.image_type) == (key.manufacturer_code, key.image_type)
+            return (self.manufacturer_id, self.image_type) == (key.manufacturer_id, key.image_type)
 
         return self == key
 
@@ -48,7 +48,7 @@ class OTAImageSubElement:
 @attr.s
 class OTAImage:
     ota_header_control_field = attr.ib(default=None)
-    manufacturer_code = attr.ib(default=None)
+    manufacturer_id = attr.ib(default=None)  # The Zigbee spec calls it both "id" and "code" so let's just use "id"
     image_type = attr.ib(default=None)
     file_version = attr.ib(default=None)
     zigbee_stack_version = attr.ib(default=None)
@@ -77,12 +77,12 @@ class OTAImage:
 
     @property
     def firmware_key(self) -> FirmwareKey:
-        return FirmwareKey(self.manufacturer_code, self.image_type, self.file_version)
+        return FirmwareKey(self.manufacturer_id, self.image_type, self.file_version)
 
-    def should_upgrade(self, manufacturer_code, img_type, ver, hw_ver) -> bool:
+    def should_upgrade(self, manufacturer_id, img_type, ver, hw_ver) -> bool:
         """Check if it should upgrade"""
 
-        if self.manufacturer_code != manufacturer_code or self.image_type != img_type:
+        if self.manufacturer_id != manufacturer_id or self.image_type != img_type:
             return False
 
         # Firmware downgrades are possible so this shouldn't be a hard requirement
@@ -132,7 +132,7 @@ class OTAImage:
 
         ota_header_length, data = t.uint16_t.deserialize(data)
         instance.ota_header_control_field, data = t.uint16_t.deserialize(data)
-        instance.manufacturer_code, data = t.uint16_t.deserialize(data)
+        instance.manufacturer_id, data = t.uint16_t.deserialize(data)
         instance.image_type, data = t.uint16_t.deserialize(data)
         instance.file_version, data = t.uint32_t.deserialize(data)
         instance.zigbee_stack_version, data = t.uint16_t.deserialize(data)
@@ -185,7 +185,7 @@ class OTAImage:
         result += t.uint16_t(self._total_header_length).serialize()
 
         result += t.uint16_t(self.ota_header_control_field).serialize()
-        result += t.uint16_t(self.manufacturer_code).serialize()
+        result += t.uint16_t(self.manufacturer_id).serialize()
         result += t.uint16_t(self.image_type).serialize()
         result += t.uint32_t(self.file_version).serialize()
         result += t.uint16_t(self.zigbee_stack_version).serialize()

@@ -45,7 +45,3 @@ class OTA:
         self._image_cache[latest.firmare_key] = latest
 
         return latest
-
-
-    def pin_firmware(self, firmware: OTAImage) -> FirmwareKey:
-        pass

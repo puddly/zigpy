@@ -671,7 +671,7 @@ class Ota(Cluster):
         0x0004: ('downloaded_file_version', t.uint32_t),
         0x0005: ('downloaded_zigbee_stack_version', t.uint16_t),
         0x0006: ('image_upgrade_status', t.enum8),
-        0x0007: ('manufacturer_code', t.uint16_t),
+        0x0007: ('manufacturer_id', t.uint16_t),
         0x0008: ('image_type_id', t.uint16_t),
         0x0009: ('minimum_block_req_delay', t.uint16_t),
         0x000a: ('image_stamp', t.uint32_t),
@@ -714,26 +714,26 @@ class Ota(Cluster):
             self.debug("OTA not implemented command for '%s %s': %s",
                        self.endpoint.manufacturer, self.endpoint.model, args)
 
-    async def _handle_query_next_image(self, field_ctrl, manufacturer_code,
+    async def _handle_query_next_image(self, field_ctrl, manufacturer_id,
                                        image_type, current_file_version,
                                        hardware_version):
         self.debug(("OTA query_next_image handler for '%s %s': "
                     "field_control=%s, manufacture_id=%s, image_type=%s, "
                     "current_file_version=%s, hardware_version=%s"),
                    self.endpoint.manufacturer, self.endpoint.model,
-                   field_ctrl, manufacturer_code, image_type,
+                   field_ctrl, manufacturer_id, image_type,
                    current_file_version, hardware_version)
 
-        key = FirmwareKey(manufacturer_code, image_type, None)  # We don't know yet
+        key = FirmwareKey(manufacturer_id, image_type, None)  # We don't know yet
         frmw = await self.endpoint.device.application.ota.get_firmware(
-            manufacturer_code, image_type)
+            manufacturer_id, image_type)
 
         if not frmw:
             self.debug("No firmware available")
             await self.query_next_image_response(foundation.Status.NO_IMAGE_AVAILABLE)
             return
 
-        update_needed = frmw.should_upgrade(manufacturer_code, image_type, current_file_version, hardware_version)
+        update_needed = frmw.should_upgrade(manufacturer_id, image_type, current_file_version, hardware_version)
         self.debug("Firmware version: %s, size: %s. Update needed: %s", frmw.version, frmw.size, update_needed)
 
         if not update_needed:
@@ -742,23 +742,23 @@ class Ota(Cluster):
 
         self.info("Updating: %s %s", self.endpoint.manufacturer, self.endpoint.model)
         await self.query_next_image_response(
-            foundation.Status.SUCCESS, frmw.manufacturer_code,
+            foundation.Status.SUCCESS, frmw.manufacturer_id,
             frmw.image_type, frmw.version, frmw.size)
 
-    async def _handle_image_block(self, field_ctr, manufacturer_code,
+    async def _handle_image_block(self, field_ctr, manufacturer_id,
                                   image_type, file_version, file_offset,
                                   max_data_size, request_node_addr,
                                   block_request_delay):
         self.debug(("OTA image_block handler for '%s %s': field_control=%s, "
-                    "manufacturer_code=%s, image_type=%s, file_version=%s, "
+                    "manufacturer_id=%s, image_type=%s, file_version=%s, "
                     "file_offset=%s, max_data_size=%s, request_node_addr=%s"
                     "block_request_delay=%s"),
                    self.endpoint.manufacturer, self.endpoint.model,
-                   field_ctr, manufacturer_code, image_type, file_version,
+                   field_ctr, manufacturer_id, image_type, file_version,
                    file_offset, max_data_size, request_node_addr,
                    block_request_delay)
 
-        key = FirmwareKey(manufacturer_code, image_type, file_version)
+        key = FirmwareKey(manufacturer_id, image_type, file_version)
 
         # A specific firmware version is supposed to be cached by now. This should not return None.
         frmw = self.endpoint.device.application.ota.immediately_get_firmware(key)
@@ -774,18 +774,18 @@ class Ota(Cluster):
 
         await self.image_block_response(
             foundation.Status.SUCCESS,
-            frmw.manufacturer_code, frmw.image_type,
+            frmw.manufacturer_id, frmw.image_type,
             frmw.version, file_offset, data
         )
 
-    async def _handle_upgrade_end(self, status, manufacturer_code, image_type,
+    async def _handle_upgrade_end(self, status, manufacturer_id, image_type,
                                   file_ver):
         self.debug(("OTA upgrade_end handler for '%s %s': status=%s, "
-                    "manufacturer_code=%s, image_type=%s, file_version=%s"),
+                    "manufacturer_id=%s, image_type=%s, file_version=%s"),
                    self.endpoint.manufacturer, self.endpoint.model,
-                   status, manufacturer_code, image_type, file_ver)
+                   status, manufacturer_id, image_type, file_ver)
         await self.upgrade_end_response(
-            manufacturer_code, image_type, file_ver, 0x00000000, 0x00000000
+            manufacturer_id, image_type, file_ver, 0x00000000, 0x00000000
         )
 
 

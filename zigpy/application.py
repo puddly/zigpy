@@ -22,7 +22,12 @@ class ControllerApplication(zigpy.util.ListenableMixin):
         self._listeners = {}
         self._ieee = None
         self._nwk = None
-        self._ota = zigpy.ota.OTA(self)
+
+        self._ota_providers = [
+            zigpy.ota.provider.Filesystem('/tmp/ota'),  # XXX: this path needs to be pulled from config
+            zigpy.ota.provider.Trådfri(),
+        ]
+        self._ota = zigpy.ota.OTA(self._ota_providers)
 
         if database_file is not None:
             self._dblistener = zigpy.appdb.PersistingListener(database_file, self)

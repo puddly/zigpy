@@ -1,79 +1,128 @@
 """OTA Firmware providers."""
+
+import inspect
+import pathlib
 import asyncio
 import logging
-from collections import defaultdict
+
 from typing import Optional
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 import aiohttp
 
-from zigpy.ota.firmware import Firmware, FirmwareKey, OTAImage
+from zigpy.ota.firmware import FirmwareKey, OTAImage
+
 
 LOGGER = logging.getLogger(__name__)
 
 
-class Trådfri:
-    UPDATE_URL = 'https://fw.ota.homesmart.ikea.net/feed/version_info.json'
-    MANUFACTURER_ID = 4476
+def timed_cache(**timedelta_kwargs):
+    expiration_delta = timedelta(**timedelta_kwargs)
 
-    def __init__(self):
-        self._cache = {}
-        self._locks = defaultdict(asyncio.Semaphore)
+    def wrapper(function):
+        async def replacement(*args, **kwargs):
+            now = datetime.utcnow()
 
-    async def initialize_provider(self) -> None:
-        LOGGER.debug("Downloading IKEA firmware update list")
-        async with self._locks['firmware_list']:
-            async with aiohttp.ClientSession() as req:
-                async with req.get(self.UPDATE_URL) as rsp:
-                    fw_lst = await rsp.json(
-                        content_type='application/octet-stream')
-        self._cache.clear()
-        frm_to_fetch = []
-        for fw in fw_lst:
-            if 'fw_file_version_MSB' not in fw:
-                continue
-            key = FirmwareKey(fw['fw_manufacturer_id'], fw['fw_image_type'])
-            version = fw['fw_file_version_MSB'] << 16
-            version |= fw['fw_file_version_LSB']
-            firmware = Firmware(
-                key, version, fw['fw_filesize'], fw['fw_binary_url'],
-            )
-            frm_to_fetch.append(self.fetch_firmware(key))
-            self._cache[key] = firmware
-        await asyncio.gather(*frm_to_fetch)
+            # XXX: I'm sure there's a cleaner way
+            key = repr((args, tuple(sorted(kwargs.items()))))
+            value, expiration = replacement._cache.get(key, (None, datetime.utcfromtimestamp(0)))
 
-    async def fetch_firmware(self, key: FirmwareKey):
-        if self._locks[key].locked():
-            return
+            if expiration > now + expiration_delta:
+                return value
 
-        frm = self._cache[key]
-        async with self._locks[key]:
-            async with aiohttp.ClientSession() as req:
-                LOGGER.debug("Downloading %s for %s", frm.url, key)
-                async with req.get(frm.url) as rsp:
-                    ikea_ota = await rsp.read()
+            value = await function(*args, **kwargs)
+            replacement._cache[key] = (value, now + expiration_delta)
 
-        assert len(ikea_ota) > 24
-        offset = int.from_bytes(ikea_ota[16:20], 'little')
-        size = int.from_bytes(ikea_ota[20:24], 'little')
-        assert len(ikea_ota) > offset + size
+            return value
 
-        frm.image = OTAImage.deserialize(ikea_ota[offset:offset + size])
-        assert frm.version == key.version
-        assert frm.image.manufacturer_id == key.image.manufacturer_id
+        replacement._cache = {}
 
-        self._cache[key] = frm
-        LOGGER.debug("Finished downloading %s bytes from %s",
-                     frm.size, frm.url)
+        return replacement
+    return wrapper
 
-    def get_firmware(self, key: FirmwareKey) -> Optional[Firmware]:
-        if key.manufacturer_id != self.MANUFACTURER_ID:
+
+class BaseOTAProvider:
+    async def refresh_firmwares(self):
+        pass
+
+    async def get_image(self, key: FirmwareKey) -> Optional[OTAImage]:
+        raise NotImplementedError()
+
+
+class Filesystem(BaseOTAProvider):
+    def __init__(self, root):
+        self.root = pathlib.Path(root)
+
+    async def get_image(self, key: FirmwareKey) -> Optional[OTAImage]:
+        # XXX: There's no real async way to do file IO yet
+        return await asyncio.get_running_loop().run_in_executor(None, self._get_image_sync, key)
+
+    def _get_image_sync(self, key: FirmwareKey) -> Optional[OTAImage]:
+        candidates = []
+
+        for path in self.root.glob('*.ota'):
+            with path.open('rb') as f:
+                ota_image = OTAImage.deserialize(f.read())
+
+            if key.is_compatible(ota_image.firmware_key):
+                candidates.append(ota_image)
+
+        if not candidates:
             return None
 
-        try:
-            return self._cache[key]
-        except KeyError:
-            pass
+        # Choose the latest one if we have duplicates
+        return max(candidates, key=lambda ota: ota.file_version)
 
-        # signal to query for new firmware
-        asyncio.ensure_future(self.fetch_firmware(key))
+
+class Trådfri(BaseOTAProvider):
+    IKEA_MANUFACTURER_CODE = 0x117C
+    VERSION_URL = 'https://fw.ota.homesmart.ikea.net/feed/version_info.json'
+
+    async def refresh_firmwares(self):
+        self._fetch_versions._cache.clear()
+        self.get_image._cache.clear()
+
+    @timed_cache(hours=12)
+    async def _fetch_versions(self):
+        logger.debug('Downloading OTA info from IKEA')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.VERSION_URL) as response:
+                return await response.json(content_type='application/octet-stream')
+
+    @timed_cache(hours=12)
+    async def get_image(self, key: FirmwareKey) -> Optional[OTAImage]:
+        # Don't hit the IKEA servers unless we actually are requesting an IKEA image
+        if key.manufacturer_code != self.IKEA_MANUFACTURER_CODE:
+            return
+
+        for fw_info in (await self._fetch_versions()):
+            if 'fw_file_version_MSB' not in fw_info:
+                continue
+
+            # We can construct this from the JSON, without downloading the OTA image
+            fw_key = FirmwareKey(
+                fw_info['fw_manufacturer_id'],
+                fw_info['fw_image_type'],
+                (fw_info['fw_file_version_MSB'] << 16) | fw_info['fw_file_version_LSB']
+            )
+
+            if not key.is_compatible(fw_key):
+                continue
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(fw_info['fw_binary_url']) as response:
+                    ikea_ota_image = await response.read()
+
+            assert len(ikea_ota_image) > 24
+            offset = int.from_bytes(ikea_ota_image[16:20], 'little')
+            size = int.from_bytes(ikea_ota_image[20:24], 'little')
+            assert len(ikea_ota_image) > offset + size
+
+            ota_image = OTAImage.deserialize(ikea_ota[offset:offset + size])
+            assert ota_image.firmware_key == fw_key
+
+            return ota_image
+
         return None

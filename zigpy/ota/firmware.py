@@ -6,42 +6,19 @@ import zigpy.types as t
 
 @attr.s(frozen=True)
 class FirmwareKey:
-    manufacturer_id = attr.ib(default=None)
+    manufacturer_code = attr.ib(default=None)
     image_type = attr.ib(default=None)
+    file_version = attr.ib(default=None)
 
+    def is_compatible(self, key: FirmwareKey) -> bool:
+        # We expect the other key to be fully populated
+        assert key.version is not None
 
-@attr.s
-class Firmware:
-    key = attr.ib(default=FirmwareKey)
-    url = attr.ib(default=None)
-    image = attr.ib(default=None)
+        if self.file_version is None:
+            return (self.manufacturer_code, self.image_type) == (key.manufacturer_code, key.image_type)
 
-    def upgradeable(self, manufacturer_id, img_type, ver, hw_ver) -> bool:
-        """Check if it should upgrade"""
+        return self == key
 
-        if self.key != FirmwareKey(manufacturer_id, img_type):
-            return False
-
-        # Firmware downgrades are possible so this shouldn't be a hard requirement
-        if self.image.file_version <= ver:
-            return False
-
-        if hw_ver is not None:
-            if self.image.minimum_hardware_version is not None and self.image.minimum_hardware_version > hw_ver:
-                return False
-
-            if self.image.maximum_hardware_version is not None and self.image.maximum_hardware_version < hw_ver:
-                return False
-
-        return True
-
-    @property
-    def version(self):
-        return self.image.file_version
-
-    @property
-    def size(self):
-        return self.image.size
 
 
 @attr.s
@@ -85,6 +62,42 @@ class OTAImage:
 
     subelements = attr.ib(default=attr.Factory(list))
 
+    def __attrs_post_init__(self):
+        self._cached_image = None
+
+    def get_block(self, offset, size):
+        # Firmware images are assumed to be immutable once a block has been requested
+        if self._cached_image is None:
+            self._cached_image = self.serialize()
+
+        if offset > len(self._cached_image):
+            raise ValueError('Offset exceeds total image size')
+
+        return self._cached_image[offset:offset + size]
+
+    @property
+    def firmware_key(self) -> FirmwareKey:
+        return FirmwareKey(self.manufacturer_code, self.image_type, self.file_version)
+
+    def should_upgrade(self, manufacturer_code, img_type, ver, hw_ver) -> bool:
+        """Check if it should upgrade"""
+
+        if self.manufacturer_code != manufacturer_code or self.image_type != img_type:
+            return False
+
+        # Firmware downgrades are possible so this shouldn't be a hard requirement
+        if self.file_version <= ver:
+            return False
+
+        if hw_ver is not None:
+            if self.minimum_hardware_version is not None and self.minimum_hardware_version > hw_ver:
+                return False
+
+            if self.maximum_hardware_version is not None and self.maximum_hardware_version < hw_ver:
+                return False
+
+        return True
+
     @property
     def _total_header_length(self):
         # Minimal header
@@ -101,6 +114,9 @@ class OTAImage:
 
     @property
     def size(self):
+        if self._cached_image is not None:
+            return len(self._cached_image)
+
         return self._total_header_length + sum(e.size for e in self.subelements)
 
     @classmethod

@@ -4,55 +4,48 @@ import asyncio
 import logging
 from typing import Optional
 
-import zigpy.ota.provider
-import zigpy.util
-from zigpy.ota.firmware import Firmware, FirmwareKey
+from zigpy.ota.firmware import FirmwareKey, OTAImage
 
 LOGGER = logging.getLogger(__name__)
 
 
-class OTA(zigpy.util.ListenableMixin):
-    """OTA Manager."""
+class OTA:
+    def __init__(self, providers):
+        self.providers = providers
 
-    def __init__(self, app, *args, **kwargs):
-        self._app = app
-        self._firmwares = {}
-        self._not_initialized = True
-        self._listeners = {}
-        self.add_listener(zigpy.ota.provider.Trådfri())
-
-    async def _initialize(self) -> None:
-        LOGGER.debug("Initialize OTA providers")
-        handlers = self.listener_event('initialize_provider')
-        if handlers:
-            await asyncio.gather(*handlers)
+        # XXX: Evict stale images from the cache.
+        # Most OTA upgrades are only a few hundred KB so it isn't a huge leak.
+        self._image_cache = {}
 
     async def refresh_firmwares(self) -> None:
         LOGGER.debug("Refreshing OTA firmwares")
-        handlers = self.listener_event('refresh_firmwares')
-        if handlers:
-            await asyncio.gather(*handlers)
+        await asyncio.gather(*[p.refresh_firmwares() for p in self.providers])
 
-    def initialize(self) -> None:
-        self._not_initialized = False
-        asyncio.ensure_future(self._initialize())
+    def immediately_get_firmware(self, key: FirmwareKey) -> Optional[OTAImage]:
+        assert key.version is not None
+        return self._image_cache.get(key)
 
-    def get_firmware(self,
-                     manufacturer_id,
-                     image_type) -> Optional[Firmware]:
-        key = FirmwareKey(manufacturer_id, image_type)
-        if key in self._firmwares:
-            return self._firmwares[key]
+    async def get_firmware(self, key: FirmwareKey) -> Optional[OTAImage]:
+        if key.version is not None:
+            if key in self._image_cache:
+                return self._image_cache[key]
 
-        frmws = self.listener_event('get_firmware', key)
-        frmws = {f.version: f for f in frmws if f}
-        if not frmws:
+            logger.warning('Firmware %s is supposed to be in the cache!', key)
+
+        firmwares = asyncio.gather(*[p.get_firmware(key) for p in self.providers])
+        firmwares = [f for f in firmwares if f is not None]
+
+        if not firmwares:
             return None
 
-        latest_firmware = frmws[max(frmws)]
-        self._firmwares[key] = latest_firmware
-        return latest_firmware
+        latest = max(firmwares, key=lambda f: f.image_version)
 
-    @property
-    def not_initialized(self):
-        return self._not_initialized
+        # OTA block requests will always refer to a specific firmware version so we should cache it.
+        # It wouldn't make sense for the image to change yet retain this info.
+        self._image_cache[latest.firmare_key] = latest
+
+        return latest
+
+
+    def pin_firmware(self, firmware: OTAImage) -> FirmwareKey:
+        pass

@@ -51,7 +51,7 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         self._listeners = {}
         self._manufacturer = None
         self._model = None
-        self.node_desc = zdo.types.NodeDescriptor()
+        self.node_desc = None
         self._node_handle = None
         self._pending = zigpy.util.Requests()
         self._relays = None
@@ -174,7 +174,11 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         timeout=APS_REPLY_TIMEOUT,
         use_ieee=False,
     ):
-        if expect_reply and self.node_desc.is_end_device in (True, None):
+        if (
+            expect_reply
+            and self.node_desc is not None
+            and self.node_desc.is_end_device in (True, None)
+        ):
             self.debug("Extending timeout for 0x%02x request", sequence)
             timeout = APS_REPLY_TIMEOUT_EXTENDED
         with self._pending.new(sequence) as req:
@@ -218,7 +222,7 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
 
     def handle_message(self, profile, cluster, src_ep, dst_ep, message):
         self.last_seen = time.time()
-        if not self.node_desc.is_valid and (
+        if self.node_desc is None and (
             self._node_handle is None or self._node_handle.done()
         ):
             self._node_handle = asyncio.ensure_future(self.refresh_node_descriptor())
@@ -302,7 +306,13 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
     @property
     def manufacturer_id(self) -> Optional[int]:
         """Return manufacturer id."""
-        return self.manufacturer_id_override or self.node_desc.manufacturer_code
+        if self.manufacturer_id_override:
+            return self.manufacturer_id_override
+
+        if self.node_desc is not None:
+            return self.node_desc.manufacturer_code
+
+        return None
 
     @property
     def model(self):

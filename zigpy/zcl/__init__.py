@@ -300,22 +300,28 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
             if isinstance(attrid, str):
                 attrid = self.attridx[attrid]
 
-            a = foundation.ReadAttributeRecord(
-                attrid, foundation.Status.UNSUPPORTED_ATTRIBUTE, foundation.TypeValue()
+            record = foundation.ReadAttributeRecord(
+                attrid=attrid, status=foundation.Status.UNSUPPORTED_ATTRIBUTE
             )
-            args.append(a)
 
-            if value is None:
-                continue
+            if value is not None:
+                try:
+                    python_type = self.attributes[attrid][1]
 
-            try:
-                a.status = foundation.Status.SUCCESS
-                python_type = self.attributes[attrid][1]
-                a.value.type = foundation.DATA_TYPES.pytype_to_datatype_id(python_type)
-                a.value.value = python_type(value)
-            except ValueError as e:
-                a.status = foundation.Status.UNSUPPORTED_ATTRIBUTE
-                self.error(str(e))
+                    record = foundation.ReadAttributeRecord(
+                        attrid=attrid,
+                        status=foundation.Status.SUCCESS,
+                        value=foundation.TypeValue(
+                            python_type=foundation.DATA_TYPES.pytype_to_datatype_id(
+                                python_type
+                            ),
+                            value=python_type(value),
+                        ),
+                    )
+                except ValueError as e:
+                    self.error(str(e))
+
+            args.append(record)
 
         return self._read_attributes_rsp(args, manufacturer=manufacturer, tsn=tsn)
 

@@ -35,10 +35,10 @@ def file_image_name(tmpdir):
 
 @pytest.fixture
 def file_image(file_image_name):
-    img = ota_p.FileImage()
+    img = ota_p.FileImage(header=mock.MagicMock())
     img.file_name = file_image_name()
-    img.manufacturer_id = MANUFACTURER_ID
-    img.image_type = IMAGE_TYPE
+    img.header.manufacturer_id = MANUFACTURER_ID
+    img.header.image_type = IMAGE_TYPE
     return img
 
 
@@ -321,7 +321,7 @@ async def test_ikea_fetch_image(mock_get, ikea_image_with_version):
 
 
 def test_file_image_key(key):
-    fimg = ota_p.FileImage()
+    fimg = ota_p.FileImage(header=mock.MagicMock())
     fimg.header.manufacturer_id = MANUFACTURER_ID
     fimg.header.image_type = IMAGE_TYPE
     fimg.header.file_version = mock.sentinel.version

@@ -30,7 +30,7 @@ def test_read_attribute_record():
 
     r = repr(rar)
     assert len(r) > 5
-    assert r.startswith("<") and r.endswith(">")
+    assert r.startswith("ReadAttributeRecord(") and r.endswith(")")
 
     ser = rar.serialize()
     assert ser == orig
@@ -93,7 +93,7 @@ def test_write_attribute_status_record():
     assert res.attrid is None
     assert d == attr_id + extra
     r = repr(res)
-    assert r.startswith("<" + foundation.WriteAttributesStatusRecord.__name__)
+    assert r.startswith(foundation.WriteAttributesStatusRecord.__name__ + "(")
     assert "status" in r
     assert "attrid" not in r
 
@@ -108,9 +108,12 @@ def test_write_attribute_status_record():
     assert "status" in r
     assert "attrid" in r
 
-    rec = foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS, 0xAABB)
+    rec = foundation.WriteAttributesStatusRecord(status=foundation.Status.SUCCESS)
     assert rec.serialize() == b"\x00"
-    rec.status = foundation.Status.UNSUPPORTED_ATTRIBUTE
+
+    rec = foundation.WriteAttributesStatusRecord(
+        status=foundation.Status.UNSUPPORTED_ATTRIBUTE, attrid=0xAABB
+    )
     assert rec.serialize()[0:1] == foundation.Status.UNSUPPORTED_ATTRIBUTE.serialize()
     assert rec.serialize()[1:] == b"\xbb\xaa"
 
@@ -155,10 +158,11 @@ def test_configure_reporting_response_serialization():
 
     # successful record serializes only Status
     rec = foundation.ConfigureReportingResponseRecord(
-        foundation.Status.SUCCESS, 0x00, 0xAABB
+        status=foundation.Status.SUCCESS, direction=0x00, attrid=0xAABB
     )
     assert rec.serialize() == b"\x00"
-    rec.status = foundation.Status.UNREPORTABLE_ATTRIBUTE
+
+    rec = rec.replace(status=foundation.Status.UNREPORTABLE_ATTRIBUTE)
     assert rec.serialize()[0:1] == foundation.Status.UNREPORTABLE_ATTRIBUTE.serialize()
     assert rec.serialize()[1:] == b"\x00\xbb\xaa"
 
@@ -419,9 +423,11 @@ def test_write_attrs_response_serialize(attributes, data):
 
     r = foundation.WriteAttributesResponse()
     for attr_id, status in attributes.items():
-        rec = foundation.WriteAttributesStatusRecord()
-        rec.status = status
-        rec.attrid = attr_id
+        if status != 0:
+            rec = foundation.WriteAttributesStatusRecord(status=status, attrid=attr_id)
+        else:
+            rec = foundation.WriteAttributesStatusRecord(status=status)
+
         r.append(rec)
 
     assert r.serialize() == data
@@ -477,10 +483,9 @@ def test_configure_reporting_response_serialize(attributes, data):
 
     r = foundation.ConfigureReportingResponse()
     for attr_id, status in attributes.items():
-        rec = foundation.ConfigureReportingResponseRecord()
-        rec.status = status
-        rec.direction = 0x01
-        rec.attrid = attr_id
+        rec = foundation.ConfigureReportingResponseRecord(
+            status=status, direction=0x01, attrid=attr_id,
+        )
         r.append(rec)
 
     assert r.serialize() == data

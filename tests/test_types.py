@@ -230,7 +230,6 @@ def test_date():
     assert r.serialize() == data
     r.year = 2020
     assert r.serialize()[0] == 2020 - 1900
-    assert t.Date().year is None
 
 
 def test_eui64():

@@ -1,11 +1,10 @@
-from unittest import mock
-
 import pytest
+from test_ota import image, image_with_version  # noqa: F401
 import zigpy.ota.image as firmware
 import zigpy.types as t
 
-MANUFACTURER_ID = mock.sentinel.manufacturer_id
-IMAGE_TYPE = mock.sentinel.image_type
+MANUFACTURER_ID = 0x1234
+IMAGE_TYPE = 0x5678
 
 
 @pytest.fixture
@@ -51,18 +50,13 @@ def _test_ota_img_header(field_control, hdr_suffix=b"", extra=b""):
 
 
 def test_ota_image_header():
-    hdr = firmware.OTAImageHeader()
-    assert hdr.security_credential_version_present is None
-    assert hdr.device_specific_file is None
-    assert hdr.hardware_versions_present is None
-
     extra = b"abcdefghklmnpqr"
 
     hdr, rest = _test_ota_img_header(b"\x00\x00", extra=extra)
     assert rest == extra
-    assert hdr.security_credential_version_present is False
-    assert hdr.device_specific_file is False
-    assert hdr.hardware_versions_present is False
+    assert hdr.security_credential_version is None
+    assert hdr.upgrade_file_destination is None
+    assert hdr.minimum_hardware_version is None and hdr.maximum_hardware_version is None
 
 
 def test_ota_image_header_security():
@@ -71,10 +65,9 @@ def test_ota_image_header_security():
     hdr, rest = _test_ota_img_header(b"\x01\x00", creds.serialize(), extra)
 
     assert rest == extra
-    assert hdr.security_credential_version_present is True
     assert hdr.security_credential_version == creds
-    assert hdr.device_specific_file is False
-    assert hdr.hardware_versions_present is False
+    assert hdr.upgrade_file_destination is None
+    assert hdr.minimum_hardware_version is None and hdr.maximum_hardware_version is None
 
 
 def test_ota_image_header_hardware_versions():
@@ -86,9 +79,12 @@ def test_ota_image_header_hardware_versions():
     )
 
     assert rest == extra
-    assert hdr.security_credential_version_present is False
-    assert hdr.device_specific_file is False
-    assert hdr.hardware_versions_present is True
+    assert hdr.security_credential_version is None
+    assert hdr.upgrade_file_destination is None
+    assert (
+        hdr.minimum_hardware_version is not None
+        and hdr.maximum_hardware_version is not None
+    )
     assert hdr.minimum_hardware_version == hw_min
     assert hdr.maximum_hardware_version == hw_max
 
@@ -100,13 +96,14 @@ def test_ota_image_destination():
 
     hdr, rest = _test_ota_img_header(b"\x02\x00", dst.serialize(), extra)
     assert rest == extra
-    assert hdr.security_credential_version_present is False
-    assert hdr.device_specific_file is True
+    assert hdr.security_credential_version is None
     assert hdr.upgrade_file_destination == dst
-    assert hdr.hardware_versions_present is False
+    assert hdr.minimum_hardware_version is None and hdr.maximum_hardware_version is None
 
 
 def test_ota_img_wrong_header():
+    # Four byte magic header is wrong
+    #           f1  <- should have this
     d = b"\x1e\xf0\xee\x0b\x00\x018\x00\x00\x00"
     d += (
         b"|\x11\x01!rE!\x12\x02\x00EBL tradfri_light_basic\x00\x00\x00"
@@ -217,47 +214,46 @@ def test_ota_image(raw_header, raw_sub_element):
         firmware.OTAImage.deserialize(raw_header(len(el1 + el2)) + el1 + el2[:-1])
 
 
-def test_ota_img_should_upgrade():
+def test_ota_img_should_upgrade(image):  # noqa: F811
     manufacturer_id = 0x2345
     image_type = 0x4567
     version = 0xABBA
 
-    hdr = firmware.OTAImageHeader()
-    hdr.manufacturer_id = manufacturer_id
-    hdr.image_type = image_type
-    hdr.file_version = version
+    image.header = image.header.replace(
+        manufacturer_id=manufacturer_id, image_type=image_type, file_version=version,
+    )
 
-    img = firmware.OTAImage(hdr)
-    assert img.should_update(manufacturer_id, image_type, version) is False
-    assert img.should_update(manufacturer_id, image_type, version - 1) is True
-    assert img.should_update(manufacturer_id, image_type - 1, version - 1) is False
-    assert img.should_update(manufacturer_id, image_type + 1, version - 1) is False
-    assert img.should_update(manufacturer_id - 1, image_type, version - 1) is False
-    assert img.should_update(manufacturer_id + 1, image_type, version - 1) is False
+    assert image.should_update(manufacturer_id, image_type, version) is False
+    assert image.should_update(manufacturer_id, image_type, version - 1) is True
+    assert image.should_update(manufacturer_id, image_type - 1, version - 1) is False
+    assert image.should_update(manufacturer_id, image_type + 1, version - 1) is False
+    assert image.should_update(manufacturer_id - 1, image_type, version - 1) is False
+    assert image.should_update(manufacturer_id + 1, image_type, version - 1) is False
 
 
-def test_ota_img_should_upgrade_hw_ver():
+def test_ota_img_should_upgrade_hw_ver(image):  # noqa: F811
     manufacturer_id = 0x2345
     image_type = 0x4567
     version = 0xABBA
 
-    hdr = firmware.OTAImageHeader()
-    hdr.field_control = 0x0004
-    hdr.manufacturer_id = manufacturer_id
-    hdr.image_type = image_type
-    hdr.file_version = version
-    hdr.minimum_hardware_version = 2
-    hdr.maximum_hardware_version = 4
+    image.header = image.header.replace(
+        manufacturer_id=manufacturer_id,
+        image_type=image_type,
+        file_version=version,
+        field_control=firmware.FieldControl.MIN_MAX_HARDWARE_VERSION_PRESENT,
+        minimum_hardware_version=2,
+        maximum_hardware_version=4,
+    )
 
-    img = firmware.OTAImage(hdr)
-    assert img.should_update(manufacturer_id, image_type, version - 1) is True
+    assert image.should_update(manufacturer_id, image_type, version - 1) is True
 
     for hw_ver in range(2, 4):
         assert (
-            img.should_update(manufacturer_id, image_type, version - 1, hw_ver) is True
+            image.should_update(manufacturer_id, image_type, version - 1, hw_ver)
+            is True
         )
-    assert img.should_update(manufacturer_id, image_type, version - 1, 1) is False
-    assert img.should_update(manufacturer_id, image_type, version - 1, 5) is False
+    assert image.should_update(manufacturer_id, image_type, version - 1, 1) is False
+    assert image.should_update(manufacturer_id, image_type, version - 1, 5) is False
 
 
 def test_get_image_block(raw_header, raw_sub_element):

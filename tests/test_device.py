@@ -293,11 +293,21 @@ def test_device_manufacture_id_override(dev):
     assert dev.manufacturer_id is None
     assert dev.manufacturer_id_override is None
 
-    dev.node_desc = zdo_t.NodeDescriptor(1, 64, 142, 4153, 82, 255, 0, 255, 0)
+    dev.node_desc = zdo_t.NodeDescriptor(
+        byte1=1,
+        byte2=64,
+        mac_capability_flags=142,
+        manufacturer_code=4153,
+        maximum_buffer_size=82,
+        maximum_incoming_transfer_size=255,
+        server_mask=0,
+        maximum_outgoing_transfer_size=255,
+        descriptor_capability_field=0,
+    )
     assert dev.manufacturer_id == 4153
 
     dev.manufacturer_id_override = 2345
     assert dev.manufacturer_id == 2345
 
-    dev.node_desc = zdo_t.NodeDescriptor()
+    dev.node_desc = None
     assert dev.manufacturer_id == 2345

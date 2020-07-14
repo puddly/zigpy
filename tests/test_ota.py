@@ -7,20 +7,32 @@ import zigpy.ota
 import zigpy.ota.image
 import zigpy.ota.provider
 
-MANUFACTURER_ID = mock.sentinel.manufacturer_id
-IMAGE_TYPE = mock.sentinel.image_type
+MANUFACTURER_ID = 0x1234
+IMAGE_TYPE = 0x5678
 
 
 @pytest.fixture
 def image_with_version():
     def img(version=100):
-        img = zigpy.ota.image.OTAImage()
-        img.header.manufacturer_id = MANUFACTURER_ID
-        img.header.image_type = IMAGE_TYPE
-        img.header.file_version = version
-        img.subelements.append(
-            zigpy.ota.image.SubElement.deserialize(b"\x00\x00\x04\x00\x00\x00abcdef")[0]
+        subelement, _ = zigpy.ota.image.SubElement.deserialize(
+            b"\x00\x00\x04\x00\x00\x00abcdef"
         )
+
+        img = zigpy.ota.image.OTAImage(
+            header=zigpy.ota.image.OTAImageHeader(
+                manufacturer_id=MANUFACTURER_ID,
+                image_type=IMAGE_TYPE,
+                file_version=version,
+                upgrade_file_id=0,
+                header_version=0,
+                header_length=60,
+                field_control=0,
+                stack_version=0x0000,
+                header_string=b"ThisIsThe32ByteLongHeaderString\x00",
+                image_size=60 + len(subelement.serialize()),
+            )
+        )
+        img.subelements.append(subelement)
         return img
 
     return img
@@ -122,7 +134,9 @@ def test_cached_image_expiration(image, monkeypatch):
 
 
 def test_cached_image_no_expiration(image, monkeypatch):
-    cached = zigpy.ota.CachedImage()
+    cached = zigpy.ota.CachedImage.new(image)
+    cached.expires_on = None
+
     monkeypatch.setattr(
         zigpy.ota,
         "TIMEDELTA_0",

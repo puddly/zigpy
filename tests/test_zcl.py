@@ -165,10 +165,9 @@ def test_reply_manufacturer(cluster):
 
 
 def test_attribute_report(cluster):
-    attr = zcl.foundation.Attribute()
-    attr.attrid = 4
-    attr.value = zcl.foundation.TypeValue()
-    attr.value.value = "manufacturer"
+    attr = zcl.foundation.Attribute(
+        attrid=4, value=zcl.foundation.TypeValue(value="manufacturer")
+    )
     hdr = mock.MagicMock(auto_spec=foundation.ZCLHeader)
     hdr.command_id = foundation.Command.Report_Attributes
     hdr.frame_control.is_general = True

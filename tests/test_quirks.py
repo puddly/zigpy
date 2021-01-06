@@ -37,6 +37,8 @@ def test_registry():
     class TestDevice(zigpy.quirks.CustomDevice):
         signature = {SIG_MODEL: "model"}
 
+    zigpy.quirks.register_quirk(TestDevice)
+
     assert TestDevice in zigpy.quirks._DEVICE_REGISTRY
     assert zigpy.quirks._DEVICE_REGISTRY.remove(TestDevice) is None  # :-/
     assert TestDevice not in zigpy.quirks._DEVICE_REGISTRY
@@ -264,6 +266,9 @@ def test_custom_device():
             SIG_MANUFACTURER: "Mock Manufacturer",
             SIG_SKIP_CONFIG: True,
         }
+
+    zigpy.quirks.register_quirk(Device)
+    zigpy.quirks.register_quirk(Device2)
 
     assert 0x8888 not in zcl.Cluster._registry
 

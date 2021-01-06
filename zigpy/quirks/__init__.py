@@ -64,14 +64,12 @@ def register_uninitialized_device_message_handler(handler: Callable) -> None:
         _uninitialized_device_message_handlers.append(handler)
 
 
-class Registry(type):
-    def __init__(cls, name, bases, nmspc):  # noqa: N805
-        super(Registry, cls).__init__(name, bases, nmspc)
-        if getattr(cls, "signature", None) is not None:
-            _DEVICE_REGISTRY.add_to_registry(cls)
+def register_quirk(custom_device: "CustomDevice") -> None:
+    """Registers a `CustomDevice` subclass as a quirk."""
+    _DEVICE_REGISTRY.add_to_registry(custom_device)
 
 
-class CustomDevice(zigpy.device.Device, metaclass=Registry):
+class CustomDevice(zigpy.device.Device):
     replacement = {}
     signature = None
 

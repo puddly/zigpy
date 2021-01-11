@@ -2,7 +2,8 @@ from unittest import mock
 
 import pytest
 
-from zigpy.quirks.registry import SIG_MODELS_INFO, DeviceRegistry
+from zigpy.const import SIG_MODELS_INFO
+from zigpy.quirks.registry import DeviceRegistry
 
 
 class FakeDevice:
@@ -47,8 +48,8 @@ def test_add_to_registry_new_sig(fake_dev):
     assert manuf_dict.__getitem__.call_args[0][0] is mock.sentinel.dev_manufacturer
     assert model_dict.__getitem__.call_count == 1
     assert model_dict.__getitem__.call_args[0][0] is mock.sentinel.dev_model
-    assert quirk_list.append.call_count == 1
-    assert quirk_list.append.call_args[0][0] is fake_dev
+    assert quirk_list.insert.call_count == 1
+    assert quirk_list.insert.call_args[0][1] is fake_dev
     quirk_list.reset_mock()
     model_dict.reset_mock()
     manuf_dict.reset_mock()
@@ -90,9 +91,9 @@ def test_add_to_registry_models_info(fake_dev):
     assert model_dict.__getitem__.call_count == 2
     assert model_dict.__getitem__.call_args_list[0][0][0] is mock.sentinel.model_1
     assert model_dict.__getitem__.call_args_list[1][0][0] is mock.sentinel.model_2
-    assert quirk_list.append.call_count == 2
-    assert quirk_list.append.call_args_list[0][0][0] is fake_dev
-    assert quirk_list.append.call_args_list[1][0][0] is fake_dev
+    assert quirk_list.insert.call_count == 2
+    assert quirk_list.insert.call_args_list[0][0][1] is fake_dev
+    assert quirk_list.insert.call_args_list[1][0][1] is fake_dev
     quirk_list.reset_mock()
     model_dict.reset_mock()
     manuf_dict.reset_mock()
@@ -130,7 +131,7 @@ def test_remove_new_sig(fake_dev):
     assert manuf_dict.__getitem__.call_args[0][0] is mock.sentinel.dev_manufacturer
     assert model_dict.__getitem__.call_count == 1
     assert model_dict.__getitem__.call_args[0][0] is mock.sentinel.dev_model
-    assert quirk_list.append.call_count == 0
+    assert quirk_list.insert.call_count == 0
     assert quirk_list.remove.call_count == 1
     assert quirk_list.remove.call_args[0][0] is fake_dev
 
@@ -171,7 +172,7 @@ def test_remove_models_info(fake_dev):
     assert model_dict.__getitem__.call_count == 2
     assert model_dict.__getitem__.call_args_list[0][0][0] is mock.sentinel.model_1
     assert model_dict.__getitem__.call_args_list[1][0][0] is mock.sentinel.model_2
-    assert quirk_list.append.call_count == 0
+    assert quirk_list.insert.call_count == 0
     assert quirk_list.remove.call_count == 2
     assert quirk_list.remove.call_args_list[0][0][0] is fake_dev
     assert quirk_list.remove.call_args_list[1][0][0] is fake_dev

@@ -5,10 +5,20 @@ import logging
 import time
 from typing import Dict, Optional, Union
 
+from zigpy.const import (
+    SIG_ENDPOINTS,
+    SIG_EP_INPUT,
+    SIG_EP_OUTPUT,
+    SIG_EP_PROFILE,
+    SIG_EP_TYPE,
+    SIG_MANUFACTURER,
+    SIG_MODEL,
+    SIG_NODE_DESC,
+)
 import zigpy.endpoint
 import zigpy.exceptions
 import zigpy.neighbor
-from zigpy.types import NWK, BroadcastAddress, Relays
+from zigpy.types import NWK, Addressing, BroadcastAddress, Relays
 import zigpy.util
 import zigpy.zcl.foundation as foundation
 import zigpy.zdo as zdo
@@ -47,7 +57,6 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         self.rssi = None
         self.last_seen = None
         self.status = Status.NEW
-        self.initializing = False
         self._group_scan_handle: Optional[asyncio.Task] = None
         self._listeners = {}
         self._manufacturer = None
@@ -59,13 +68,20 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         self._relays = None
         self._skip_configuration = False
 
+    @property
+    def initializing(self) -> bool:
+        """Return True if device is being initialized."""
+        return bool(self._init_handle and not self._init_handle.done())
+
     def schedule_initialize(self):
+        self.cancel_initialization()
+        self._init_handle = asyncio.create_task(self._initialize())
+
+    def cancel_initialization(self) -> None:
+        """Cancel initialization call."""
         if self.initializing:
             LOGGER.debug("Canceling old initialize call")
             self._init_handle.cancel()
-        else:
-            self.initializing = True
-        self._init_handle = asyncio.ensure_future(self._initialize())
 
     def schedule_group_membership_scan(self) -> None:
         """Rescan device group's membership."""
@@ -108,7 +124,6 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
                         "Endpoint request failed: %s", status
                     )
             except (asyncio.TimeoutError, zigpy.exceptions.ZigbeeException):
-                self.initializing = False
                 self.warning("Failed to discover active endpoints", exc_info=True)
                 return
 
@@ -136,13 +151,11 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
             if epid
         ]
         if any(ep_failed_init):
-            self.initializing = False
             self.application.listener_event("device_init_failure", self)
             await self.application.remove(self.ieee)
             return
 
         self.status = Status.ENDPOINTS_INIT
-        self.initializing = False
         self._application.device_initialized(self)
 
     def add_endpoint(self, endpoint_id):
@@ -214,7 +227,18 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
     def deserialize(self, endpoint_id, cluster_id, data):
         return self.endpoints[endpoint_id].deserialize(cluster_id, data)
 
-    def handle_message(self, profile, cluster, src_ep, dst_ep, message):
+    def handle_message(
+        self,
+        profile: int,
+        cluster: int,
+        src_ep: int,
+        dst_ep: int,
+        message: bytes,
+        *,
+        dst_addressing: Optional[
+            Union[Addressing.Group, Addressing.IEEE, Addressing.NWK]
+        ] = None,
+    ):
         self.last_seen = time.time()
         try:
             hdr, args = self.deserialize(src_ep, cluster, message)
@@ -252,7 +276,9 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
                 )
                 return
         endpoint = self.endpoints[src_ep]
-        return endpoint.handle_message(profile, cluster, hdr, args)
+        return endpoint.handle_message(
+            profile, cluster, hdr, args, dst_addressing=dst_addressing
+        )
 
     def reply(self, profile, cluster, src_ep, dst_ep, sequence, data, use_ieee=False):
         return self.request(
@@ -332,28 +358,29 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
 
     def get_signature(self):
         # return the device signature by providing essential device information
-        #    - Model Identifier ( Attribut 0x0005 of Basic Cluster 0x0000 )
-        #    - Manufacturer Name ( Attribut 0x0004 of Basic Cluster 0x0000 )
+        #    - Model Identifier ( Attribute 0x0005 of Basic Cluster 0x0000 )
+        #    - Manufacturer Name ( Attribute 0x0004 of Basic Cluster 0x0000 )
         #    - Endpoint list
         #        - Profile Id, Device Id, Cluster Out, Cluster In
         signature = {}
         if self._manufacturer is not None:
-            signature["manufacturer_name"] = self.manufacturer
+            signature[SIG_MANUFACTURER] = self.manufacturer
         if self._model is not None:
-            signature["model"] = self._model
+            signature[SIG_MODEL] = self._model
         if self.node_desc.is_valid:
-            signature["node_descriptor"] = self.node_desc.as_dict()
+            signature[SIG_NODE_DESC] = self.node_desc.as_dict()
 
         for endpoint_id, endpoint in self.endpoints.items():
             if endpoint_id == 0:  # ZDO
                 continue
+            signature.setdefault(SIG_ENDPOINTS, {})
             in_clusters = [c for c in endpoint.in_clusters]
             out_clusters = [c for c in endpoint.out_clusters]
-            signature[endpoint_id] = {
-                "profileid": endpoint.profile_id,
-                "deviceid": endpoint.device_type,
-                "in_clusters": in_clusters,
-                "out_clusters": out_clusters,
+            signature[SIG_ENDPOINTS][endpoint_id] = {
+                SIG_EP_PROFILE: endpoint.profile_id,
+                SIG_EP_TYPE: endpoint.device_type,
+                SIG_EP_INPUT: in_clusters,
+                SIG_EP_OUTPUT: out_clusters,
             }
         return signature
 

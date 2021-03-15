@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import dataclasses
 import logging
 from typing import (
     Any,
@@ -38,6 +41,17 @@ _uninitialized_device_message_handlers = []
 
 def get_device(device: zigpy.device.Device, registry: Optional[DeviceRegistry] = None):
     """Get a CustomDevice object, if one is available"""
+    # First try to see if a custom quirk matcher exists
+    for matcher in _quirk_matchers:
+        if not matcher.match(device):
+            continue
+
+        device = matcher.quirk(device) or device
+        device._quirked = True
+
+        return device
+
+    # Otherwise, use the device registry
     if registry is None:
         return _DEVICE_REGISTRY.get_device(device)
 
@@ -287,3 +301,71 @@ def handle_message_from_uninitialized_sender(
     for handler in _uninitialized_device_message_handlers:
         if handler(sender, profile, cluster, src_ep, dst_ep, message):
             break
+
+
+@dataclasses.dataclass(frozen=True)
+class QuirkMatcher:
+    models: tuple[str, str]  # (manufacturer, model)
+    endpoints: dict[int, dict]
+    matcher: Callable[[zigpy.device.Device], bool]
+
+    quirk: Callable[[zigpy.device.Device], None]
+
+    def match(self, device: zigpy.device.Device) -> bool:
+        if self.models and (device.manufacturer, device.model) not in self.models:
+            return False
+
+        if self.endpoints:
+            if set(self.endpoints.keys()) != set(device.endpoints.keys()) - {0}:
+                return False
+
+            for ep_id, dev_ep in device.endpoints.items():
+                if ep_id == 0:
+                    continue
+
+                ep = self.endpoints[ep_id]
+
+                if dev_ep.profile_id != ep[SIG_EP_PROFILE]:
+                    return False
+
+                if dev_ep.device_type != ep[SIG_EP_TYPE]:
+                    return False
+
+                if set(dev_ep.in_clusters) != set(ep[SIG_EP_INPUT]):
+                    return False
+
+                if set(dev_ep.out_clusters) != set(ep[SIG_EP_OUTPUT]):
+                    return False
+
+        if self.matcher and not self.matcher(device):
+            return False
+
+        return True
+
+
+_quirk_matchers: list[QuirkMatcher] = []
+
+
+def match(
+    *,
+    models: tuple[str, str] = None,
+    endpoints: dict[int, dict] = None,
+    matcher: Callable[[zigpy.device.Device], bool] = None,
+):
+    """
+    Creates a quirk matcher decorator with the provided filters.
+    """
+
+    def decorator(function):
+        quirk_matcher = QuirkMatcher(
+            models=tuple(models) if models is not None else None,
+            endpoints=endpoints if endpoints is not None else None,
+            matcher=matcher if matcher is not None else None,
+            quirk=function,
+        )
+
+        _quirk_matchers.append(quirk_matcher)
+
+        return function
+
+    return decorator

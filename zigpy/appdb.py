@@ -384,7 +384,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             await self.execute(q, (device.nwk, device.status, device.ieee))
 
         await self._save_node_descriptor(device)
-        if isinstance(device, zigpy.quirks.CustomDevice):
+        if isinstance(device, zigpy.quirks.CustomDevice) or device.quirked:
             await self._db.commit()
             return
 

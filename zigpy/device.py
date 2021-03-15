@@ -67,6 +67,11 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         self._pending = zigpy.util.Requests()
         self._relays = None
         self._skip_configuration = False
+        self._quirked = False
+
+    @property
+    def quirked(self):
+        return self._quirked
 
     @property
     def initializing(self) -> bool:

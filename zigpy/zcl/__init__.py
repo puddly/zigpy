@@ -26,7 +26,13 @@ class Registry(type):
         }
 
         for commands_type in ("server_commands", "client_commands"):
-            commands = getattr(cls, commands_type, None)
+            commands = getattr(cls, commands_type)
+
+            for command_id, (name, schema, is_reply) in commands.items():
+                # XXX: Ignore dict schemas for now
+                if isinstance(schema, dict):
+                    commands[command_id] = (name, tuple(schema.values()), is_reply)
+
             manufacturer_specific = getattr(cls, f"manufacturer_{commands_type}", {})
             commands_idx = {}
             if manufacturer_specific:

@@ -11,4 +11,5 @@ from . import (
     protocol,
     security,
     smartenergy,
+    touchlink,
 )

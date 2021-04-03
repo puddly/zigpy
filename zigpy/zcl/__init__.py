@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import enum
 import functools
+import inspect
 import logging
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple, Union
 
@@ -10,6 +13,44 @@ from zigpy.typing import EndpointType
 from zigpy.zcl import foundation
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _schema_signature(schema: tuple | dict) -> inspect.Signature:
+    if not isinstance(schema, dict):
+        schema = {f"param{i}": s for i, s in enumerate(schema, start=1)}
+
+    return inspect.Signature(
+        parameters=[
+            inspect.Parameter(
+                name=name,
+                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=(
+                    None
+                    if getattr(param_type, "optional", False)
+                    else inspect.Parameter.empty
+                ),
+                annotation=param_type,
+            )
+            for name, param_type in schema.items()
+        ]
+    )
+
+
+def _serialize_schema(schema: tuple | dict, *args, **kwargs):
+    signature = _schema_signature(schema)
+
+    bound = signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+
+    values = []
+    types = []
+
+    for arg, value in bound.arguments.items():
+        if value is not None:
+            values.append(value)
+            types.append(signature.parameters[arg].annotation)
+
+    return t.serialize(values, types)
 
 
 class Registry(type):
@@ -27,12 +68,6 @@ class Registry(type):
 
         for commands_type in ("server_commands", "client_commands"):
             commands = getattr(cls, commands_type)
-
-            for command_id, (name, schema, is_reply) in commands.items():
-                # XXX: Ignore dict schemas for now
-                if isinstance(schema, dict):
-                    commands[command_id] = (name, tuple(schema.values()), is_reply)
-
             manufacturer_specific = getattr(cls, f"manufacturer_{commands_type}", {})
             commands_idx = {}
             if manufacturer_specific:
@@ -110,21 +145,23 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
                 commands = self.server_commands
 
             try:
-                schema = commands[hdr.command_id][1]
-                hdr.frame_control.is_reply = commands[hdr.command_id][2]
+                _, schema, hdr.frame_control.is_reply = commands[hdr.command_id]
             except KeyError:
                 self.warning("Unknown cluster-specific command %s", hdr.command_id)
                 return hdr, data
         else:
             # General command
             try:
-                schema = foundation.COMMANDS[hdr.command_id][0]
-                hdr.frame_control.is_reply = foundation.COMMANDS[hdr.command_id][1]
+                schema, hdr.frame_control.is_reply = foundation.COMMANDS[hdr.command_id]
             except KeyError:
                 self.warning("Unknown foundation command %s", hdr.command_id)
                 return hdr, data
 
-        value, data = t.deserialize(data, schema)
+        if isinstance(schema, dict):
+            value, data = t.deserialize(data, schema.values())
+        else:
+            value, data = t.deserialize(data, schema)
+
         if data != b"":
             self.warning("Data remains after deserializing ZCL frame")
 
@@ -140,27 +177,23 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         manufacturer: Optional[Union[int, t.uint16_t]] = None,
         expect_reply: bool = True,
         tsn: Optional[Union[int, t.uint8_t]] = None,
+        **kwargs,
     ):
-        optional = len([s for s in schema if hasattr(s, "optional") and s.optional])
-        if len(schema) < len(args) or len(args) < len(schema) - optional:
-            self.error("Schema and args lengths do not match in request")
-            error = asyncio.Future()
-            error.set_exception(
-                ValueError(
-                    "Wrong number of parameters for request, expected %d argument(s)"
-                    % len(schema)
-                )
-            )
-            return error
-
         if tsn is None:
             tsn = self._endpoint.device.application.get_sequence()
+
         if general:
             hdr = foundation.ZCLHeader.general(tsn, command_id, manufacturer)
         else:
             hdr = foundation.ZCLHeader.cluster(tsn, command_id, manufacturer)
-        hdr.manufacturer = manufacturer
-        data = hdr.serialize() + t.serialize(args, schema)
+
+        try:
+            data = hdr.serialize() + _serialize_schema(schema, *args, **kwargs)
+        except TypeError as e:
+            error = asyncio.Future()
+            error.set_exception(ValueError(str(e)))
+
+            return error
 
         return self._endpoint.request(
             self.cluster_id, tsn, data, expect_reply=expect_reply, command_id=command_id
@@ -174,12 +207,11 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         *args,
         manufacturer: Optional[Union[int, t.uint16_t]] = None,
         tsn: Optional[Union[int, t.uint8_t]] = None,
+        **kwargs,
     ):
-        if len(schema) != len(args) and foundation.Status not in schema:
-            self.debug("Schema and args lengths do not match in reply")
-
         if tsn is None:
             tsn = self._endpoint.device.application.get_sequence()
+
         if general:
             hdr = foundation.ZCLHeader.general(
                 tsn, command_id, manufacturer, is_reply=True
@@ -189,7 +221,14 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
                 tsn, command_id, manufacturer, is_reply=True
             )
         hdr.manufacturer = manufacturer
-        data = hdr.serialize() + t.serialize(args, schema)
+
+        try:
+            data = hdr.serialize() + _serialize_schema(schema, *args, **kwargs)
+        except TypeError as e:
+            error = asyncio.Future()
+            error.set_exception(ValueError(str(e)))
+
+            return error
 
         return self._endpoint.reply(self.cluster_id, tsn, data, command_id=command_id)
 
@@ -348,8 +387,8 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         return self._read_attributes_rsp(args, manufacturer=manufacturer, tsn=tsn)
 
     def _write_attr_records(
-        self, attributes: Dict[Union[str, int], Any]
-    ) -> List[foundation.Attribute]:
+        self, attributes: dict[str | int, Any]
+    ) -> list[foundation.Attribute]:
         args = []
         for attrid, value in attributes.items():
             if isinstance(attrid, str):
@@ -390,7 +429,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         return result
 
     def write_attributes_undivided(
-        self, attributes: Dict[Union[str, int], Any], manufacturer: Optional[int] = None
+        self, attributes: dict[str | int, Any], manufacturer: Optional[int] = None
     ) -> List:
         """Either all or none of the attributes are written by the device."""
         args = self._write_attr_records(attributes)
@@ -430,7 +469,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def configure_reporting(
         self,
-        attribute: Union[int, str],
+        attribute: int | str,
         min_interval: int,
         max_interval: int,
         reportable_change: int,
@@ -486,14 +525,21 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def client_command(
         self,
-        command_id: Union[foundation.Command, int, t.uint8_t],
+        command_id: foundation.Command | int | t.uint8_t,
         *args,
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
-        tsn: Optional[Union[int, t.uint8_t]] = None,
+        manufacturer: Optional[int | t.uint16_t] = None,
+        tsn: Optional[int | t.uint8_t] = None,
+        **kwargs,
     ):
         schema = self.client_commands[command_id][1]
         return self.reply(
-            False, command_id, schema, *args, manufacturer=manufacturer, tsn=tsn
+            False,
+            command_id,
+            schema,
+            *args,
+            manufacturer=manufacturer,
+            tsn=tsn,
+            **kwargs,
         )
 
     @property
@@ -576,12 +622,20 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         expect_reply: bool = True,
         tries: int = 1,
         tsn: Optional[Union[int, t.uint8_t]] = None,
+        **kwargs,
     ):
-        schema = foundation.COMMANDS[command_id][0]
-        if foundation.COMMANDS[command_id][1]:
+        schema, is_response = foundation.COMMANDS[command_id]
+
+        if is_response:
             # should reply be retryable?
             return self.reply(
-                True, command_id, schema, *args, manufacturer=manufacturer, tsn=tsn
+                True,
+                command_id,
+                schema,
+                *args,
+                manufacturer=manufacturer,
+                tsn=tsn,
+                **kwargs,
             )
 
         return self.request(
@@ -593,6 +647,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
             expect_reply=expect_reply,
             tries=tries,
             tsn=tsn,
+            **kwargs,
         )
 
     _configure_reporting = functools.partialmethod(

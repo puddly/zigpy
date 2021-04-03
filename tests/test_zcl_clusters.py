@@ -39,11 +39,18 @@ def _test_commands(cmdattr):
             assert isinstance(cmdspec, tuple), "Cluster %s" % (cluster_id,)
             assert len(cmdspec) == 3
             assert isinstance(cmdspec[0], str)
-            assert isinstance(cmdspec[1], tuple)
+            assert isinstance(cmdspec[1], (tuple, dict))
             assert isinstance(cmdspec[2], bool)
-            for t in cmdspec[1]:
-                assert hasattr(t, "serialize")
-                assert hasattr(t, "deserialize")
+
+            if isinstance(cmdspec[1], tuple):
+                for t in cmdspec[1]:
+                    assert hasattr(t, "serialize")
+                    assert hasattr(t, "deserialize")
+            else:
+                for name, t in cmdspec[1].items():
+                    assert name.isidentifier()
+                    assert hasattr(t, "serialize")
+                    assert hasattr(t, "deserialize")
 
 
 def test_server_commands():

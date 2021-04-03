@@ -616,6 +616,51 @@ def test_command(cluster):
     assert cluster._endpoint.request.call_args[0][1] == DEFAULT_TSN
 
 
+def test_command_kwargs(cluster_by_id):
+    cluster = cluster_by_id(0x1000)
+
+    zigbee_info = zcl.clusters.touchlink.TLZigbeeInformation(
+        logical_type=zcl.clusters.touchlink.TLLogicalType.Coordinator,
+        rx_on_when_idle=True,
+        reserved=0b00000,
+    )
+
+    tl_info = zcl.clusters.touchlink.TLScanRequestInformation(
+        factory_new=False,
+        address_assignment=True,
+        reserved1=0b00,
+        touchlink_initiator=True,
+        undefined=0b0,
+        reserved2=0b0,
+        profile_interop=0b1,
+    )
+
+    cluster.scan_request(
+        inter_pan_transaction_id=1234,
+        zigbee_information=zigbee_info,
+        touchlink_information=tl_info,
+    )
+
+    assert cluster._endpoint.request.call_count == 1
+
+    # Command kwargs must exist
+    res = cluster.scan_request(
+        inter_pan_transaction_id=1234,
+        zigbee_information=zigbee_info,
+        touchlink_information=tl_info,
+        unknown=5,
+    )
+
+    assert isinstance(res.exception(), ValueError)
+
+    # Calling with args works too
+    cluster.scan_request(1234, zigbee_info, tl_info)
+    assert cluster._endpoint.request.call_count == 2
+
+    # And the two calls will end up sending the exact same serialized data
+    assert cluster._endpoint.request.calls[0] == cluster._endpoint.request.calls[1]
+
+
 def test_command_override_tsn(cluster):
     cluster.command(0x00, tsn=22)
     assert cluster._endpoint.request.call_count == 1

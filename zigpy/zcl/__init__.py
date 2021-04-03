@@ -510,6 +510,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         expect_reply: bool = True,
         tries: int = 1,
         tsn: Optional[int | t.uint8_t] = None,
+        **kwargs,
     ):
         schema = self.server_commands[command_id][1]
         return self.request(
@@ -521,6 +522,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
             expect_reply=expect_reply,
             tries=tries,
             tsn=tsn,
+            **kwargs,
         )
 
     def client_command(

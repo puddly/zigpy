@@ -5,7 +5,7 @@ import enum
 import functools
 import inspect
 import logging
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Coroutine, Optional
 
 from zigpy import util
 import zigpy.types as t
@@ -62,7 +62,7 @@ class Registry(type):
         manufacturer_attributes = getattr(cls, "manufacturer_attributes", None)
         if manufacturer_attributes:
             cls.attributes = {**cls.attributes, **manufacturer_attributes}
-        cls.attridx: Dict[str, int] = {
+        cls.attridx: dict[str, int] = {
             attr_name: attr_id for attr_id, (attr_name, _) in cls.attributes.items()
         }
 
@@ -96,19 +96,19 @@ class ClusterType(enum.IntEnum):
 class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
     """A cluster on an endpoint"""
 
-    _registry: Dict = {}
-    _registry_custom_clusters: Set = set()
-    _registry_range: Dict = {}
-    _server_commands_idx: Dict[str, int] = {}
-    _client_commands_idx: Dict[str, int] = {}
-    attridx: Dict[str, int]
-    attributes: Dict[int, Tuple[str, Callable]] = {}
-    client_commands: Dict[int, Tuple[str, Tuple, bool]] = {}
-    server_commands: Dict[int, Tuple[str, Tuple, bool]] = {}
+    _registry: dict = {}
+    _registry_custom_clusters: set = set()
+    _registry_range: dict = {}
+    _server_commands_idx: dict[str, int] = {}
+    _client_commands_idx: dict[str, int] = {}
+    attridx: dict[str, int]
+    attributes: dict[int, str | Callable] = {}
+    client_commands: dict[int, tuple[str, tuple | dict, bool]] = {}
+    server_commands: dict[int, tuple[str, tuple | dict, bool]] = {}
 
     def __init__(self, endpoint: EndpointType, is_server: bool = True):
         self._endpoint: EndpointType = endpoint
-        self._attr_cache: Dict[int, Any] = {}
+        self._attr_cache: dict[int, Any] = {}
         self._listeners = {}
         if is_server:
             self._type: ClusterType = ClusterType.Server
@@ -171,12 +171,12 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
     def request(
         self,
         general: bool,
-        command_id: Union[foundation.Command, int, t.uint8_t],
-        schema: Tuple,
+        command_id: foundation.Command | int | t.uint8_t,
+        schema: tuple | dict,
         *args,
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
+        manufacturer: Optional[int | t.uint16_t] = None,
         expect_reply: bool = True,
-        tsn: Optional[Union[int, t.uint8_t]] = None,
+        tsn: Optional[int | t.uint8_t] = None,
         **kwargs,
     ):
         if tsn is None:
@@ -202,11 +202,11 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
     def reply(
         self,
         general: bool,
-        command_id: Union[foundation.Command, int, t.uint8_t],
-        schema: Tuple,
+        command_id: foundation.Command | int | t.uint8_t,
+        schema: tuple | dict,
         *args,
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
-        tsn: Optional[Union[int, t.uint8_t]] = None,
+        manufacturer: Optional[int | t.uint16_t] = None,
+        tsn: Optional[int | t.uint8_t] = None,
         **kwargs,
     ):
         if tsn is None:
@@ -235,10 +235,10 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
     def handle_message(
         self,
         hdr: foundation.ZCLHeader,
-        args: List[Any],
+        args: list[Any],
         *,
         dst_addressing: Optional[
-            Union[t.Addressing.Group, t.Addressing.IEEE, t.Addressing.NWK]
+            t.Addressing.Group | t.Addressing.IEEE | t.Addressing.NWK
         ] = None,
     ):
         self.debug("ZCL request 0x%04x: %s", hdr.command_id, args)
@@ -252,10 +252,10 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
     def handle_cluster_request(
         self,
         hdr: foundation.ZCLHeader,
-        args: List[Any],
+        args: list[Any],
         *,
         dst_addressing: Optional[
-            Union[t.Addressing.Group, t.Addressing.IEEE, t.Addressing.NWK]
+            t.Addressing.Group | t.Addressing.IEEE | t.Addressing.NWK
         ] = None,
     ):
         self.debug("No handler for cluster command %s", hdr.command_id)
@@ -263,10 +263,10 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
     def handle_cluster_general_request(
         self,
         hdr: foundation.ZCLHeader,
-        args: List,
+        args: list,
         *,
         dst_addressing: Optional[
-            Union[t.Addressing.Group, t.Addressing.IEEE, t.Addressing.NWK]
+            t.Addressing.Group | t.Addressing.IEEE | t.Addressing.NWK
         ] = None,
     ) -> None:
         if hdr.command_id == foundation.Command.Report_Attributes:
@@ -409,8 +409,8 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         return args
 
     async def write_attributes(
-        self, attributes: Dict[Union[str, int], Any], manufacturer: Optional[int] = None
-    ) -> List:
+        self, attributes: dict[str | int, Any], manufacturer: Optional[int] = None
+    ) -> list:
         args = self._write_attr_records(attributes)
         result = await self._write_attributes(args, manufacturer=manufacturer)
         if not isinstance(result[0], list):
@@ -430,7 +430,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def write_attributes_undivided(
         self, attributes: dict[str | int, Any], manufacturer: Optional[int] = None
-    ) -> List:
+    ) -> list:
         """Either all or none of the attributes are written by the device."""
         args = self._write_attr_records(attributes)
         return self._write_attributes_undivided(args, manufacturer=manufacturer)
@@ -443,7 +443,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def _attr_reporting_rec(
         self,
-        attribute: Union[int, str],
+        attribute: int | str,
         min_interval: int,
         max_interval: int,
         reportable_change: int = 1,
@@ -482,7 +482,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def configure_reporting_multiple(
         self,
-        attributes: Dict[Union[int, str], Tuple[int, int, int]],
+        attributes: dict[int | str, tuple[int, int, int]],
         manufacturer: Optional[int] = None,
     ) -> Coroutine:
         """Configure attribute reporting for multiple attributes in the same request.
@@ -504,12 +504,12 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def command(
         self,
-        command_id: Union[foundation.Command, int, t.uint8_t],
+        command_id: foundation.Command | int | t.uint8_t,
         *args,
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
+        manufacturer: Optional[int | t.uint16_t] = None,
         expect_reply: bool = True,
         tries: int = 1,
-        tsn: Optional[Union[int, t.uint8_t]] = None,
+        tsn: Optional[int | t.uint8_t] = None,
     ):
         schema = self.server_commands[command_id][1]
         return self.request(
@@ -587,7 +587,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
         else:
             raise AttributeError("No such command name: %s" % (name,))
 
-    def get(self, key: Union[int, str], default: Optional[Any] = None) -> Any:
+    def get(self, key: int | str, default: Optional[Any] = None) -> Any:
         """Get cached attribute."""
         if isinstance(key, int):
             return self._attr_cache.get(key, default)
@@ -600,7 +600,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
         raise ValueError("attr_name or attr_id are accepted only")
 
-    def __getitem__(self, key: Union[int, str]) -> Any:
+    def __getitem__(self, key: int | str) -> Any:
         """Return cached value of the attr."""
         if isinstance(key, int):
             return self._attr_cache[key]
@@ -608,7 +608,7 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
             return self._attr_cache[self.attridx[key]]
         raise ValueError("attr_name or attr_id are accepted only")
 
-    def __setitem__(self, key: Union[int, str], value: Any) -> None:
+    def __setitem__(self, key: int | str, value: Any) -> None:
         """Set cached value through attribute write."""
         if not isinstance(key, (int, str)):
             raise ValueError("attr_name or attr_id are accepted only")
@@ -616,12 +616,12 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, metaclass=Registry):
 
     def general_command(
         self,
-        command_id: Union[foundation.Command, int, t.uint8_t],
+        command_id: foundation.Command | int | t.uint8_t,
         *args,
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
+        manufacturer: Optional[int | t.uint16_t] = None,
         expect_reply: bool = True,
         tries: int = 1,
-        tsn: Optional[Union[int, t.uint8_t]] = None,
+        tsn: Optional[int | t.uint8_t] = None,
         **kwargs,
     ):
         schema, is_response = foundation.COMMANDS[command_id]

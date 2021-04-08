@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import zigpy.types as t
 
@@ -236,7 +236,7 @@ class WriteAttributesResponse(list):
     """
 
     @classmethod
-    def deserialize(cls, data: bytes) -> Tuple["WriteAttributesResponse", bytes]:
+    def deserialize(cls, data: bytes) -> tuple[WriteAttributesResponse, bytes]:
         record, data = WriteAttributesStatusRecord.deserialize(data)
         r = cls([record])
         if record.status == Status.SUCCESS:
@@ -553,9 +553,9 @@ class ZCLHeader(t.Struct):
     @classmethod
     def general(
         cls,
-        tsn: Union[int, t.uint8_t],
-        command_id: Union[int, t.uint8_t],
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
+        tsn: int | t.uint8_t,
+        command_id: int | t.uint8_t,
+        manufacturer: Optional[int | t.uint16_t] = None,
         is_reply: bool = False,
     ) -> ZCLHeader:
         return cls(
@@ -568,9 +568,9 @@ class ZCLHeader(t.Struct):
     @classmethod
     def cluster(
         cls,
-        tsn: Union[int, t.uint8_t],
-        command_id: Union[int, t.uint8_t],
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
+        tsn: int | t.uint8_t,
+        command_id: int | t.uint8_t,
+        manufacturer: Optional[int | t.uint16_t] = None,
         is_reply: bool = False,
     ) -> ZCLHeader:
         return cls(

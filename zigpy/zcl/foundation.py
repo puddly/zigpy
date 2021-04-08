@@ -330,37 +330,23 @@ class AttributeReportingConfig:
 
 class ConfigureReportingResponseRecord(t.Struct):
     status: Status
-    direction: ReportingDirection
-    attrid: t.uint16_t
+    direction: ReportingDirection = t.StructField(
+        requires=lambda s: s.status != Status.SUCCESS
+    )
+    attrid: t.uint16_t = t.StructField(requires=lambda s: s.status != Status.SUCCESS)
 
     @classmethod
-    def deserialize(cls, data):
-        r = cls()
-        r.status, data = Status.deserialize(data)
-        if r.status == Status.SUCCESS:
-            r.direction, data = t.Optional(t.uint8_t).deserialize(data)
-            if r.direction is not None:
-                r.direction = ReportingDirection(r.direction)
-            r.attrid, data = t.Optional(t.uint16_t).deserialize(data)
-            return r, data
+    def deserialize(cls, data: bytes) -> ConfigureReportingResponseRecord:
+        record, data = super().deserialize(data)
 
-        r.direction, data = ReportingDirection.deserialize(data)
-        r.attrid, data = t.uint16_t.deserialize(data)
-        return r, data
+        if record.status == Status.SUCCESS:
+            if data:
+                record.direction, data = ReportingDirection.deserialize(data)
 
-    def serialize(self):
-        r = Status(self.status).serialize()
-        if self.status != Status.SUCCESS:
-            r += ReportingDirection(self.direction).serialize()
-            r += t.uint16_t(self.attrid).serialize()
-        return r
+            if data:
+                record.attrid, data = t.uint16_t.deserialize(data)
 
-    def __repr__(self):
-        r = f"{self.__class__.__name__}(status={self.status}"
-        if self.status != Status.SUCCESS:
-            r += f", direction={self.direction}, attrid={self.attrid}"
-        r += ")"
-        return r
+        return record, data
 
 
 class ConfigureReportingResponse(t.List[ConfigureReportingResponseRecord]):
@@ -532,91 +518,37 @@ class FrameControl(t.Struct, t.uint8_t):
         return bool(self.frame_type == FrameType.GLOBAL_COMMAND)
 
 
-class ZCLHeader:
+class ZCLHeader(t.Struct):
     """ZCL Header."""
 
-    def __init__(
-        self,
-        frame_control: FrameControl,
-        tsn: Union[int, t.uint8_t] = 0,
-        command_id: Union[Command, int, t.uint8_t] = 0,
-        manufacturer: Optional[Union[int, t.uint16_t]] = None,
-    ) -> None:
-        """Initialize ZCL Frame instance."""
-        self._frc = frame_control
-        if frame_control.is_general:
-            self._cmd_id = Command(command_id)
-        else:
-            self._cmd_id = t.uint8_t(command_id)
-        self._manufacturer = manufacturer
+    frame_control: FrameControl
+    manufacturer: t.uint16_t = t.StructField(
+        requires=lambda h: h.frame_control.is_manufacturer_specific
+    )
+    tsn: t.uint8_t
+    command_id: t.uint8_t
+
+    def __new__(
+        cls, frame_control=None, manufacturer=None, tsn=None, command_id=None
+    ) -> ZCLHeader:
         if manufacturer is not None:
-            self.frame_control.is_manufacturer_specific = True
-        self._tsn = t.uint8_t(tsn)
+            frame_control.is_manufacturer_specific = True
 
-    @property
-    def frame_control(self) -> FrameControl:
-        """Return frame control."""
-        return self._frc
+        if frame_control is not None and frame_control.is_general:
+            command_id = Command(command_id)
 
-    @property
-    def command_id(self) -> Command:
-        """Return command identifier."""
-        return self._cmd_id
-
-    @command_id.setter
-    def command_id(self, value: Command) -> None:
-        """Setter for command identifier."""
-        if self.frame_control.is_general:
-            self._cmd_id = Command(value)
-            return
-        self._cmd_id = t.uint8_t(value)
+        return super().__new__(cls, frame_control, manufacturer, tsn, command_id)
 
     @property
     def is_reply(self) -> bool:
         """Return direction of Frame Control."""
         return self.frame_control.is_reply
 
-    @property
-    def manufacturer(self) -> Optional[t.uint16_t]:
-        """Return manufacturer id."""
-        if self._manufacturer is None:
-            return None
-        return t.uint16_t(self._manufacturer)
+    def __setattr__(self, name, value) -> None:
+        super().__setattr__(name, value)
 
-    @manufacturer.setter
-    def manufacturer(self, value: t.uint16_t) -> None:
-        self.frame_control.is_manufacturer_specific = bool(value)
-        self._manufacturer = value
-
-    @property
-    def tsn(self) -> t.uint8_t:
-        """Return transaction seq number."""
-        return self._tsn
-
-    @tsn.setter
-    def tsn(self, value: t.uint8_t) -> None:
-        """Setter for tsn."""
-        self._tsn = t.uint8_t(value)
-
-    @classmethod
-    def deserialize(cls, data):
-        """Deserialize from bytes."""
-        frc, data = FrameControl.deserialize(data)
-        r = cls(frc)
-        if frc.is_manufacturer_specific:
-            r.manufacturer, data = t.uint16_t.deserialize(data)
-        r.tsn, data = t.uint8_t.deserialize(data)
-        r.command_id, data = Command.deserialize(data)
-        return r, data
-
-    def serialize(self):
-        """Serialize to bytes."""
-        d = self.frame_control.serialize()
-        if self.frame_control.is_manufacturer_specific:
-            d += self.manufacturer.serialize()
-        d += self.tsn.serialize()
-        d += self.command_id.serialize()
-        return d
+        if name == "manufacturer" and self.frame_control is not None:
+            self.frame_control.is_manufacturer_specific = value is not None
 
     @classmethod
     def general(
@@ -625,11 +557,13 @@ class ZCLHeader:
         command_id: Union[int, t.uint8_t],
         manufacturer: Optional[Union[int, t.uint16_t]] = None,
         is_reply: bool = False,
-    ) -> "ZCLHeader":
-        r = cls(FrameControl.general(is_reply), tsn, command_id, manufacturer)
-        if manufacturer is not None:
-            r.frame_control.is_manufacturer_specific = True
-        return r
+    ) -> ZCLHeader:
+        return cls(
+            frame_control=FrameControl.general(is_reply),
+            manufacturer=manufacturer,
+            tsn=tsn,
+            command_id=command_id,
+        )
 
     @classmethod
     def cluster(
@@ -638,18 +572,10 @@ class ZCLHeader:
         command_id: Union[int, t.uint8_t],
         manufacturer: Optional[Union[int, t.uint16_t]] = None,
         is_reply: bool = False,
-    ) -> "ZCLHeader":
-        r = cls(FrameControl.cluster(is_reply), tsn, command_id, manufacturer)
-        if manufacturer is not None:
-            r.frame_control.is_manufacturer_specific = True
-        return r
-
-    def __repr__(self) -> str:
-        """Representation."""
-        return "<{} frame_control={} manufacturer={} tsn={} command_id={}>".format(
-            self.__class__.__name__,
-            self.frame_control,
-            self.manufacturer,
-            self.tsn,
-            str(self.command_id),
+    ) -> ZCLHeader:
+        return cls(
+            frame_control=FrameControl.cluster(is_reply),
+            manufacturer=manufacturer,
+            tsn=tsn,
+            command_id=command_id,
         )

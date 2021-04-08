@@ -25,7 +25,7 @@ def test_deserialize_general(endpoint):
     hdr, args = endpoint.deserialize(0, b"\x00\x01\x00")
     assert hdr.tsn == 1
     assert hdr.command_id == 0
-    assert hdr.is_reply is False
+    assert not hdr.is_reply
 
 
 def test_deserialize_general_unknown(endpoint):
@@ -34,7 +34,7 @@ def test_deserialize_general_unknown(endpoint):
     assert hdr.frame_control.is_general is True
     assert hdr.frame_control.is_cluster is False
     assert hdr.command_id == 255
-    assert hdr.is_reply is False
+    assert not hdr.is_reply
 
 
 def test_deserialize_cluster(endpoint):
@@ -43,7 +43,7 @@ def test_deserialize_cluster(endpoint):
     assert hdr.frame_control.is_general is False
     assert hdr.frame_control.is_cluster is True
     assert hdr.command_id == 0
-    assert hdr.is_reply is False
+    assert not hdr.is_reply
 
 
 def test_deserialize_cluster_client(endpoint):
@@ -65,7 +65,7 @@ def test_deserialize_cluster_command_unknown(endpoint):
     hdr, args = endpoint.deserialize(0, b"\x01\x01\xff")
     assert hdr.tsn == 1
     assert hdr.command_id == 255
-    assert hdr.is_reply is False
+    assert not hdr.is_reply
 
 
 def test_unknown_cluster():

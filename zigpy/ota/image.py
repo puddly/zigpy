@@ -18,19 +18,9 @@ class ImageKey:
     image_type = attr.ib(default=None)
 
 
-class HWVersion(t.uint16_t):
-    @property
-    def version(self):
-        return self >> 8
-
-    @property
-    def revision(self):
-        return self & 0x00FF
-
-    def __repr__(self):
-        return "<{} version={} revision={}>".format(
-            self.__class__.__name__, self.version, self.revision
-        )
+class HWVersion(t.Struct, t.uint16_t):
+    revision: t.uint8_t
+    version: t.uint8_t
 
 
 class HeaderString(str):

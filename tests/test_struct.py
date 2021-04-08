@@ -697,3 +697,36 @@ def test_bitstruct_complex():
 
     assert neighbor == neighbor2
     assert neighbor2.serialize() == data
+
+
+def test_int_struct():
+    class IntegralStruct(t.Struct, t.uint32_t):
+        foo: t.uint8_t
+        bar: t.uint16_t
+        baz: t.uint7_t
+        asd: t.uint1_t
+
+    class IntegralStruct2(IntegralStruct):
+        pass
+
+    assert (
+        IntegralStruct(0b0_1110001_1100110011001100_10101010)
+        == IntegralStruct(
+            foo=0b10101010,
+            bar=0b1100110011001100,
+            baz=0b1110001,
+            asd=0b0,
+        )
+        == 0b0_1110001_1100110011001100_10101010
+    )
+
+    assert (
+        IntegralStruct2(0b0_1110001_1100110011001100_10101010)
+        == IntegralStruct2(
+            foo=0b10101010,
+            bar=0b1100110011001100,
+            baz=0b1110001,
+            asd=0b0,
+        )
+        == 0b0_1110001_1100110011001100_10101010
+    )

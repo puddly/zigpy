@@ -110,6 +110,29 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         """Return True if device is being initialized."""
         return self._initialize_task is not None and not self._initialize_task.done()
 
+    async def reset(self):
+        """
+        Resets a device at runtime, bringing it into a clean state where only its NWK
+        address is known.
+        """
+
+        LOGGER.debug("Resetting device %s", self)
+
+        if self._initialize_task is not None:
+            self._initialize_task.cancel()
+
+        self._model = None
+        self._manufacturer = None
+        self.node_desc = None
+        self.status = Status.NEW
+
+        # Delete all of the non-ZDO endpoints
+        for ep in self.non_zdo_endpoints:
+            del self.endpoints[ep.endpoint_id]
+
+        # Signal to the database that the device was removed but don't really delete it
+        self._application.listener_event("device_removed", self)
+
     def cancel_initialization(self) -> None:
         """Cancel initialization call."""
         if self.initializing:

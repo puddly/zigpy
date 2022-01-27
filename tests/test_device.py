@@ -335,3 +335,24 @@ def test_device_manufacture_id_override(dev):
 
     dev.node_desc = None
     assert dev.manufacturer_id == 2345
+
+
+async def test_reset(dev):
+    dev.node_desc = zdo_t.NodeDescriptor(1, 1, 1, 4, 5, 6, 7, 8)
+    dev._model = "Model"
+    dev._manufacturer = "Manufacturer"
+    dev.status = device.Status.ENDPOINTS_INIT
+
+    ep = dev.add_endpoint(1)
+    ep.status = endpoint.Status.ZDO_INIT
+    ep.add_input_cluster(0x0001)
+
+    assert dev.is_initialized
+
+    await dev.reset()
+
+    assert dev.node_desc is None
+    assert dev.model is None
+    assert dev.manufacturer is None
+    assert dev.non_zdo_endpoints == []
+    assert dev.status == device.Status.NEW

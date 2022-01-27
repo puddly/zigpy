@@ -811,3 +811,31 @@ def test_pysqlite_load_failure(stdlib_version, pysqlite3_version):
     ):
         with pytest.raises(RuntimeError):
             zigpy.appdb._import_compatible_sqlite3(zigpy.appdb.MIN_SQLITE_VERSION)
+
+
+@patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
+async def test_device_reset(tmpdir):
+    db = os.path.join(str(tmpdir), "test.db")
+    app = await make_app(db)
+    ieee = make_ieee()
+    nwk = 199
+    app.handle_join(nwk, ieee, 0)
+
+    dev = app.get_device(ieee)
+    ep = dev.add_endpoint(1)
+    ep.status = zigpy.endpoint.Status.ZDO_INIT
+    ep.profile_id = 65535
+    ep.device_type = profiles.zha.DeviceType.PUMP
+    clus = ep.add_input_cluster(0)
+    ep.add_output_cluster(1)
+    app.device_initialized(dev)
+    clus._update_attribute(4, "Custom")
+    clus._update_attribute(5, "Model")
+
+    await dev.reset()
+    assert not dev.is_initialized
+
+    # XXX: database events are unidirectional so we have no way to know when it's ready
+    await asyncio.sleep(0.1)
+
+    await app.pre_shutdown()

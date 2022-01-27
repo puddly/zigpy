@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import types
 from typing import Any
@@ -191,6 +192,21 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         # XXX: This will break if you use a semicolon anywhere but at the end of a line
         for statement in sql.split(";"):
             await self.execute(statement)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """
+        Context manager that rolls back if any error occurs and commits otherwise.
+        """
+        await self.execute("BEGIN TRANSACTION")
+
+        try:
+            yield
+        except Exception:
+            await self.execute("ROLLBACK TRANSACTION")
+            raise
+        else:
+            await self.execute("COMMIT TRANSACTION")
 
     def device_joined(self, device: zigpy.typing.DeviceType) -> None:
         self.enqueue("_update_device_nwk", device.ieee, device.nwk)

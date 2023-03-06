@@ -8,7 +8,7 @@ on:
 env:
   CACHE_VERSION: 3
   PYTHON_VERSION_DEFAULT: '3.9.15'
-  PRE_COMMIT_HOME: ~/.cache/pre-commit
+  PRE_COMMIT_HOME: $HOME/.cache/pre-commit
 
 jobs:
   # Separate job to pre-populate the base dependency cache
@@ -20,6 +20,10 @@ jobs:
       matrix:
         python-version: ['3.8.14', '3.9.15', '3.10.8', '3.11.0']
     steps:
+      # Required for shell expansion to work
+      - name: Set environment variables
+        run: |
+          echo "PRE_COMMIT_HOME=${{ env.PRE_COMMIT_HOME }}" >> $GITHUB_ENV
       - name: Check out code from GitHub
         uses: actions/checkout@v3
       - name: Set up Python ${{ matrix.python-version }}

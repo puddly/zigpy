@@ -78,8 +78,10 @@ jobs:
         if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
           . venv/bin/activate
+          pre-commit clean
           mkdir -p ${{ env.PRE_COMMIT_HOME }}
           pre-commit install --install-hooks
+          find ${{ env.PRE_COMMIT_HOME }}
 
   lint-black:
     name: Check black

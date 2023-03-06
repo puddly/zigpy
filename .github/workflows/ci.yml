@@ -20,10 +20,6 @@ jobs:
       matrix:
         python-version: ['3.8.14', '3.9.15', '3.10.8', '3.11.0']
     steps:
-      # Required for shell expansion to work
-      - name: Set environment variables
-        run: |
-          echo "PRE_COMMIT_HOME=${{ env.PRE_COMMIT_HOME }}" >> $GITHUB_ENV
       - name: Check out code from GitHub
         uses: actions/checkout@v3
       - name: Set up Python ${{ matrix.python-version }}
@@ -81,6 +77,9 @@ jobs:
       - name: Install pre-commit dependencies
         if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
+          # `HOME` within the variable won't be expanded by the GitHub action
+          export PRE_COMMIT_HOME=$(echo $PRE_COMMIT_HOME | envsubst)
+
           . venv/bin/activate
           pre-commit clean
           mkdir -p ${{ env.PRE_COMMIT_HOME }}

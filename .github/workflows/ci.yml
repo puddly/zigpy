@@ -79,7 +79,7 @@ jobs:
         run: |
           . venv/bin/activate
           mkdir -p ${{ env.PRE_COMMIT_HOME }}
-          pre-commit install-hooks
+          pre-commit install --install-hooks
 
   lint-black:
     name: Check black

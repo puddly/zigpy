@@ -121,10 +121,10 @@ jobs:
           path: ${{ env.PRE_COMMIT_HOME }}
           key: |
             ${{ env.CACHE_VERSION}}-${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
-      - name: Fail job if cache restore failed
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Fail job if pre-commit cache restore failed
+        if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
-          echo "Failed to restore Python virtual environment from cache"
+          echo "Failed to restore pre-commit virtual environment from cache"
           exit 1
       - name: Run black
         run: |
@@ -164,10 +164,10 @@ jobs:
           path: ${{ env.PRE_COMMIT_HOME }}
           key: |
             ${{ env.CACHE_VERSION}}-${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
-      - name: Fail job if cache restore failed
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Fail job if pre-commit cache restore failed
+        if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
-          echo "Failed to restore Python virtual environment from cache"
+          echo "Failed to restore pre-commit virtual environment from cache"
           exit 1
       - name: Register flake8 problem matcher
         run: |
@@ -210,10 +210,10 @@ jobs:
           path: ${{ env.PRE_COMMIT_HOME }}
           key: |
             ${{ env.CACHE_VERSION}}-${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
-      - name: Fail job if cache restore failed
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Fail job if pre-commit cache restore failed
+        if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
-          echo "Failed to restore Python virtual environment from cache"
+          echo "Failed to restore pre-commit virtual environment from cache"
           exit 1
       - name: Run isort
         run: |
@@ -253,10 +253,10 @@ jobs:
           path: ${{ env.PRE_COMMIT_HOME }}
           key: |
             ${{ env.CACHE_VERSION}}-${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
-      - name: Fail job if cache restore failed
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Fail job if pre-commit cache restore failed
+        if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
-          echo "Failed to restore Python virtual environment from cache"
+          echo "Failed to restore pre-commit virtual environment from cache"
           exit 1
       - name: Register codespell problem matcher
         run: |
@@ -299,10 +299,10 @@ jobs:
           path: ${{ env.PRE_COMMIT_HOME }}
           key: |
             ${{ env.CACHE_VERSION}}-${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
-      - name: Fail job if cache restore failed
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Fail job if pre-commit cache restore failed
+        if: steps.cache-precommit.outputs.cache-hit != 'true'
         run: |
-          echo "Failed to restore Python virtual environment from cache"
+          echo "Failed to restore pre-commit virtual environment from cache"
           exit 1
       - name: Run mypy
         run: |

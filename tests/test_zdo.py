@@ -7,7 +7,7 @@ import zigpy.types as t
 import zigpy.zdo as zdo
 import zigpy.zdo.types as zdo_types
 
-from .async_mock import AsyncMock, MagicMock, patch, sentinel
+from .async_mock import AsyncMock, MagicMock, patch, sentinel, call
 
 
 def test_commands():
@@ -143,6 +143,20 @@ async def test_handle_ieee_addr(zdo_f):
     hdr.command_id = zdo_types.ZDOCmd.IEEE_addr_req
     zdo_f.handle_message(5, 0x0001, hdr, [nwk, 0x00])
     assert zdo_f.reply.call_count == 1
+
+
+async def test_handle_active_ep_req(zdo_f):
+    zdo_f._device.nwk = 0x0000
+
+    hdr = MagicMock()
+    hdr.command_id = zdo_types.ZDOCmd.Active_EP_req
+
+    with patch.object(zdo_f, "Active_EP_rsp") as mock_active_ep_rsp:
+        zdo_f.handle_message(5, zdo_types.ZDOCmd.Active_EP_req, hdr, [0x0000])
+
+    assert mock_active_ep_rsp.mock_calls == [
+        call(zdo_types.Status.SUCCESS, 0x0000, [], tsn=hdr.tsn)
+    ]
 
 
 def test_handle_announce(zdo_f):

@@ -184,6 +184,26 @@ class ZDO(zigpy.util.CatchingTaskMixin, zigpy.util.ListenableMixin):
             self.Match_Desc_rsp(0, local_addr, [t.uint8_t(1)], tsn=hdr.tsn)
         )
 
+    def handle_active_ep_req(
+        self,
+        hdr: types.ZDOHeader,
+        addr: t.NWK,
+        dst_addressing: AddressingMode | None = None,
+    ):
+        """Handle ZDO Active_EP_req request."""
+        self.create_catching_task(
+            self.Active_EP_rsp(
+                *dict(  # noqa: C408
+                    Status=types.Status.SUCCESS,
+                    NWKAddrOfInterest=self._device.nwk,
+                    ActiveEPList=[
+                        ep.endpoint_id for ep in self._device.non_zdo_endpoints
+                    ],
+                ).values(),
+                tsn=hdr.tsn,
+            )
+        )
+
     def bind(self, cluster):
         return self.Bind_req(
             self._device.ieee,

@@ -933,29 +933,16 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         # All migrations must succeed. If any fail, the database is not touched.
         async with self._transaction():
-            for migration, to_db_version in [
-                (self._migrate_to_v4, 4),
-                (self._migrate_to_v5, 5),
-                (self._migrate_to_v6, 6),
-                (self._migrate_to_v7, 7),
-                (self._migrate_to_v8, 8),
-                (self._migrate_to_v9, 9),
-                (self._migrate_to_v10, 10),
-                (self._migrate_to_v11, 11),
-                (self._migrate_to_v12, 12),
-                (self._migrate_to_v13, 13),
-                (self._migrate_to_v13, 14),
-            ]:
-                if db_version >= min(to_db_version, DB_VERSION):
-                    continue
+            for version in range(4, DB_VERSION):
+                migration = getattr(self, f"_migrate_to_v{version}")
 
                 LOGGER.info(
-                    "Migrating database from v%d to v%d", db_version, to_db_version
+                    "Migrating database from v%d to v%d", db_version, version
                 )
-                await self.executescript(zigpy.appdb_schemas.SCHEMAS[to_db_version])
+                await self.executescript(zigpy.appdb_schemas.SCHEMAS[version])
                 await migration()
 
-                db_version = to_db_version
+                db_version = version
 
         return True
 

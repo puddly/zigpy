@@ -268,6 +268,56 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         await self._db.commit()
 
+    def device_extra_state_updated(
+        self,
+        device: zigpy.typing.DeviceType,
+        key: str,
+        value: float | int,
+        significant_change: float | int,
+        min_change_interval: float,
+        timestamp: datetime,
+    ) -> None:
+        self.enqueue(
+            "_save_device_extra_state",
+            device.ieee,
+            key,
+            value,
+            significant_change,
+            min_change_interval,
+            timestamp,
+        )
+
+    async def _save_device_extra_state(
+        self,
+        ieee: t.EUI64,
+        key: str,
+        value: float | int,
+        significant_change: float,
+        timestamp: datetime,
+    ) -> None:
+        q = f"""
+            INSERT INTO extra_device_state{DB_V}
+            VALUES (:ieee, :key, :value, :timestamp)
+                ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id) DO UPDATE
+                SET value=excluded.value, last_updated=excluded.last_updated
+                WHERE
+                    abs(value - excluded.value) > :significant_change
+                    OR :timestamp - last_updated > :min_update_delta
+            """
+
+        await self.execute(
+            q,
+            {
+                "ieee": ieee,
+                "key": key,
+                "value": value,
+                "timestamp": timestamp,
+                "significant_change": significant_change,
+                "min_update_delta": MIN_UPDATE_DELTA,
+            },
+        )
+        await self._db.commit()
+
     def attribute_updated(
         self,
         cluster: zigpy.typing.ClusterType,
@@ -732,9 +782,15 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 )
 
                 # Populate the device's manufacturer and model attributes
-                if cluster_id == Basic.cluster_id and attr_id == Basic.AttributeDefs.manufacturer.id:
+                if (
+                    cluster_id == Basic.cluster_id
+                    and attr_id == Basic.AttributeDefs.manufacturer.id
+                ):
                     dev.manufacturer = decode_str_attribute(value)
-                elif cluster_id == Basic.cluster_id and attr_id == Basic.AttributeDefs.model.id:
+                elif (
+                    cluster_id == Basic.cluster_id
+                    and attr_id == Basic.AttributeDefs.model.id
+                ):
                     dev.model = decode_str_attribute(value)
 
     async def _load_unsupported_attributes(self) -> None:
@@ -936,9 +992,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             for version in range(4, DB_VERSION):
                 migration = getattr(self, f"_migrate_to_v{version}")
 
-                LOGGER.info(
-                    "Migrating database from v%d to v%d", db_version, version
-                )
+                LOGGER.info("Migrating database from v%d to v%d", db_version, version)
                 await self.executescript(zigpy.appdb_schemas.SCHEMAS[version])
                 await migration()
 

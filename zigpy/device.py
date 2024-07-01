@@ -97,6 +97,8 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         # Retained for backwards compatibility, will be removed in a future release
         self.status = Status.NEW
 
+        self.extra_state: dict[str, typing.Any] = {}
+
     def get_sequence(self) -> t.uint8_t:
         self._send_sequence = (self._send_sequence + 1) % 256
         return self._send_sequence
@@ -555,6 +557,35 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         )
 
         return result
+
+    async def update_extra_device_state(
+        self,
+        key: str,
+        value: float | int,
+        *,
+        significant_change: float | int = 0,
+        min_change_interval: float = 30,
+    ) -> None:
+        """Update extra device state."""
+
+        # This desynchronizes the device state from the DB state but this likely isn't
+        # going to be a problem, extra state should not be critical.
+        old_value = self.extra_state[key]
+        self.extra_state[key] = value
+
+        # Filter before emitting the event
+        if abs(value - old_value) < significant_change:
+            return
+
+        self.listener_event(
+            "device_extra_state_updated",
+            self,
+            key,
+            value,
+            significant_change,
+            min_change_interval,
+            datetime.now(timezone.utc),
+        )
 
     def radio_details(self, lqi=None, rssi=None) -> None:
         if lqi is not None:

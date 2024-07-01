@@ -214,13 +214,13 @@ CREATE TABLE network_backups_v14 (
 );
 
 
--- extra device information
+-- extra device state information
 DROP TABLE IF EXISTS extra_device_state_v14;
 CREATE TABLE extra_device_state_v14 (
     ieee ieee NOT NULL,
     info_key TEXT NOT NULL,
     last_updated REAL NOT NULL,
-    data TEXT NOT NULL,
+    data NUMERIC NOT NULL,
 
     FOREIGN KEY(ieee)
         REFERENCES devices_v14(ieee)

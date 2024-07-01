@@ -77,7 +77,7 @@ def _register_sqlite_adapters():
     sqlite3.register_adapter(t.EUI64, adapt_ieee)
     sqlite3.register_adapter(t.ExtendedPanId, adapt_ieee)
 
-    def convert_ieee(s):
+    def convert_ieee(s: bytes) -> t.EUI64:
         return t.EUI64.convert(s.decode())
 
     sqlite3.register_converter("ieee", convert_ieee)
@@ -705,6 +705,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def load(self) -> None:
         LOGGER.debug("Loading application state")
         await self._load_devices()
+        await self._load_extra_state()
         await self._load_node_descriptors()
         await self._load_endpoints()
         await self._load_clusters()
@@ -828,6 +829,12 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
                 if last_seen > 0:
                     dev.last_seen = last_seen
+
+    async def _load_extra_state(self) -> None:
+        async with self.execute(f"SELECT * FROM extra_device_state{DB_V}") as cursor:
+            async for (ieee, info_key, _last_updated, data) in cursor:
+                dev = self._application.get_device(ieee=ieee)
+                dev.extra_state[info_key] = data
 
     async def _load_node_descriptors(self) -> None:
         async with self.execute(f"SELECT * FROM node_descriptors{DB_V}") as cursor:

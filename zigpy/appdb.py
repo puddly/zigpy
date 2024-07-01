@@ -29,7 +29,7 @@ from zigpy.zdo import types as zdo_t
 
 LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 13
+DB_VERSION = 14
 DB_V = f"_v{DB_VERSION}"
 MIN_SQLITE_VERSION = (3, 24, 0)
 
@@ -944,6 +944,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 (self._migrate_to_v11, 11),
                 (self._migrate_to_v12, 12),
                 (self._migrate_to_v13, 13),
+                (self._migrate_to_v13, 14),
             ]:
                 if db_version >= min(to_db_version, DB_VERSION):
                     continue
@@ -1312,3 +1313,23 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         last_updated,
                     ),
                 )
+
+    async def _migrate_to_v14(self):
+        """Schema v14 adds a new `extra_device_state` table."""
+
+        await self._migrate_tables(
+            {
+                "devices_v13": "devices_v14",
+                "endpoints_v13": "endpoints_v14",
+                "neighbors_v13": "neighbors_v14",
+                "routes_v13": "routes_v14",
+                "node_descriptors_v13": "node_descriptors_v14",
+                "groups_v13": "groups_v14",
+                "group_members_v13": "group_members_v14",
+                "relays_v13": "relays_v14",
+                "network_backups_v13": "network_backups_v14",
+                "clusters_v13": "clusters_v14",
+                "unsupported_attributes_v13": "unsupported_attributes_v14",
+                "attributes_cache_v13": "attributes_cache_v14",
+            }
+        )

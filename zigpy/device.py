@@ -558,7 +558,7 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
 
         return result
 
-    async def update_extra_device_state(
+    def update_extra_device_state(
         self,
         key: str,
         value: float | int,

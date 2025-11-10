@@ -20,7 +20,7 @@ import warnings
 import zigpy.appdb
 import zigpy.backups
 import zigpy.config as conf
-from zigpy.const import INTERFERENCE_MESSAGE
+from zigpy.const import INTERFERENCE_MESSAGE, ColorMode
 from zigpy.datastructures import RequestLimiter
 import zigpy.device
 import zigpy.endpoint
@@ -333,6 +333,22 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
             )
 
         return actual_tx_power
+
+    def _get_supported_led_mode(self) -> ColorMode | None:
+        """Get supported LED modes (if supported by the radio)."""
+        return None
+
+    def get_supported_led_mode(self) -> ColorMode | None:
+        """Get supported LED modes (if supported by the radio)."""
+        return self._get_supported_led_mode()
+
+    async def _set_led_state(self, *, r: int, g: int, b: int) -> None:
+        """Set LED color, internal."""
+        LOGGER.debug("Radio does not support setting LED state, ignoring")
+
+    async def set_led_state(self, *, r: int, g: int, b: int) -> None:
+        """Set LED color (if supported by the radio)."""
+        await self._set_led_state(r=r, g=g, b=b)
 
     async def _move_network_to_channel(
         self, new_channel: int, new_nwk_update_id: int

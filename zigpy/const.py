@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 SIG_ENDPOINTS = "endpoints"
 SIG_EP_INPUT = "input_clusters"
 SIG_EP_OUTPUT = "output_clusters"
@@ -22,3 +24,9 @@ INTERFERENCE_MESSAGE = (
 
 APS_REPLY_TIMEOUT = 5
 APS_REPLY_TIMEOUT_EXTENDED = 28
+
+
+class ColorMode(StrEnum):
+    """Possible LED color modes."""
+
+    RGB = "rgb"

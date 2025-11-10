@@ -20,7 +20,7 @@ import warnings
 import zigpy.appdb
 import zigpy.backups
 import zigpy.config as conf
-from zigpy.const import INTERFERENCE_MESSAGE, ColorMode
+from zigpy.const import INTERFERENCE_MESSAGE, CoordinatorColorMode
 from zigpy.datastructures import RequestLimiter
 import zigpy.device
 import zigpy.endpoint
@@ -334,11 +334,11 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
 
         return actual_tx_power
 
-    def _get_supported_led_mode(self) -> ColorMode | None:
+    def _get_supported_led_mode(self) -> CoordinatorColorMode | None:
         """Get supported LED modes (if supported by the radio)."""
         return None
 
-    def get_supported_led_mode(self) -> ColorMode | None:
+    def get_supported_led_mode(self) -> CoordinatorColorMode | None:
         """Get supported LED modes (if supported by the radio)."""
         return self._get_supported_led_mode()
 

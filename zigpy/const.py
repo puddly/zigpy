@@ -26,7 +26,7 @@ APS_REPLY_TIMEOUT = 5
 APS_REPLY_TIMEOUT_EXTENDED = 28
 
 
-class ColorMode(StrEnum):
-    """Possible LED color modes."""
+class CoordinatorColorMode(StrEnum):
+    """Possible coordinator LED color modes."""
 
     RGB = "rgb"

@@ -201,7 +201,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         await self._db.close()
 
         # FIXME: aiosqlite's thread won't always be closed immediately
-        await asyncio.get_running_loop().run_in_executor(None, self._db.join)
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            (self._db.join if hasattr(self._db, "join") else self._db._thread.join),
+        )
 
     def enqueue(self, cb_name: str, *args) -> None:
         """Enqueue an async callback handler action."""

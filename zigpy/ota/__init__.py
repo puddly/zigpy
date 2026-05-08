@@ -26,7 +26,6 @@ from zigpy.config import (
     CONF_OTA_PROVIDERS,
     CONF_OTA_REMOTE_PROVIDERS,
     CONF_OTA_SALUS,
-    CONF_OTA_SONOFF,
     CONF_OTA_THIRDREALITY,
     CONF_OTA_Z2M_LOCAL_INDEX,
     CONF_OTA_Z2M_REMOTE_INDEX,
@@ -419,10 +418,6 @@ class OTA:
         register_deprecated_provider(
             enabled=config.get(CONF_OTA_SALUS),
             provider=zigpy.ota.providers.Salus,
-        )
-        register_deprecated_provider(
-            enabled=config.get(CONF_OTA_SONOFF),
-            provider=zigpy.ota.providers.Sonoff,
         )
         register_deprecated_provider(
             enabled=config.get(CONF_OTA_THIRDREALITY),

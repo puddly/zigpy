@@ -84,7 +84,7 @@ async def test_ota_enabled_legacy(tmp_path: pathlib.Path) -> None:
     )
 
     # All are enabled
-    assert len(ota._providers) == 9
+    assert len(ota._providers) == 8
 
 
 async def test_ota_config(tmp_path: pathlib.Path) -> None:
@@ -108,7 +108,6 @@ async def test_ota_config(tmp_path: pathlib.Path) -> None:
     assert ota._providers == [
         zigpy.ota.providers.ZigpyOtaProvider(),
         zigpy.ota.providers.Ledvance(),
-        zigpy.ota.providers.Sonoff(),
         zigpy.ota.providers.Inovelli(),
         zigpy.ota.providers.ThirdReality(),
         zigpy.ota.providers.Tradfri(),
@@ -165,7 +164,6 @@ async def test_ota_config_complex(tmp_path: pathlib.Path) -> None:
                 config.CONF_OTA_DISABLE_DEFAULT_PROVIDERS: [
                     "zigpy_ota",
                     "ikea",
-                    "sonoff",
                     "ledvance",
                 ],
                 config.CONF_OTA_EXTRA_PROVIDERS: [
@@ -215,7 +213,6 @@ async def test_ota_config_complex(tmp_path: pathlib.Path) -> None:
     assert ota._providers == [
         # zigpy.ota.providers.ZigpyOtaProvider(),
         # zigpy.ota.providers.Ledvance(),
-        # zigpy.ota.providers.Sonoff(),
         zigpy.ota.providers.Inovelli(),
         zigpy.ota.providers.ThirdReality(),
         zigpy.ota.providers.Salus(url="https://salus.example.org/"),

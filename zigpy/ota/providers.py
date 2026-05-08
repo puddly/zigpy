@@ -388,36 +388,6 @@ class Salus(BaseOtaProvider):
 
 
 @register_provider
-class Sonoff(BaseOtaProvider):
-    NAME = "sonoff"
-    MANUFACTURER_IDS = (4742,)
-
-    JSON_SCHEMA = json_schemas.SONOFF_SCHEMA
-    VOL_SCHEMA = zigpy.config.SCHEMA_OTA_PROVIDER_URL
-
-    async def _load_index(
-        self, session: aiohttp.ClientSession
-    ) -> typing.AsyncIterator[BaseOtaImageMetadata]:
-        async with session.get(
-            "https://zigbee-ota.sonoff.tech/releases/upgrade.json"
-        ) as rsp:
-            fw_lst = await rsp.json()
-
-        jsonschema.validate(fw_lst, self.JSON_SCHEMA)
-
-        for fw in fw_lst:
-            yield RemoteOtaImageMetadata(
-                file_version=fw["fw_file_version"],
-                manufacturer_id=fw["fw_manufacturer_id"],
-                image_type=fw["fw_image_type"],
-                file_size=fw["fw_filesize"],
-                url=fw["fw_binary_url"],
-                model_names=(fw["model_id"],),
-                source="Sonoff",
-            )
-
-
-@register_provider
 class Inovelli(BaseOtaProvider):
     NAME = "inovelli"
     MANUFACTURER_IDS = (4655,)

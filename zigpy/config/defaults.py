@@ -42,9 +42,6 @@ CONF_OTA_PROVIDERS_DEFAULT = [
         CONF_OTA_PROVIDER_TYPE: "ledvance",
     },
     {
-        CONF_OTA_PROVIDER_TYPE: "sonoff",
-    },
-    {
         CONF_OTA_PROVIDER_TYPE: "inovelli",
     },
     {

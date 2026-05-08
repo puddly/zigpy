@@ -169,29 +169,6 @@ LEDVANCE_SCHEMA = {
     "required": ["firmwares"],
 }
 
-SONOFF_SCHEMA = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "fw_binary_url": {"type": "string", "format": "uri"},
-            "fw_file_version": {"type": "integer"},
-            "fw_filesize": {"type": "integer"},
-            "fw_image_type": {"type": "integer"},
-            "fw_manufacturer_id": {"type": "integer"},
-            "model_id": {"type": "string"},
-        },
-        "required": [
-            "fw_binary_url",
-            "fw_file_version",
-            "fw_filesize",
-            "fw_image_type",
-            "fw_manufacturer_id",
-            "model_id",
-        ],
-    },
-}
-
 INOVELLI_SCHEMA = {
     "type": "object",
     "patternProperties": {

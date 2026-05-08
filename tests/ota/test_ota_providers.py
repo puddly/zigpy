@@ -423,33 +423,6 @@ async def test_ledvance_provider():
         assert not obj
 
 
-async def test_sonoff_provider():
-    index_json = (FILES_DIR / "sonoff_upgrade.json").read_text()
-    index_obj = json.loads(index_json)
-
-    provider = providers.Sonoff()
-
-    with aioresponses() as mock_http:
-        mock_http.get(
-            "https://zigbee-ota.sonoff.tech/releases/upgrade.json",
-            body=index_json,
-        )
-
-        index = await provider.load_index()
-
-    assert len(index) == len(index_obj)
-
-    for obj, meta in zip(index_obj, index, strict=True):
-        assert isinstance(meta, providers.RemoteOtaImageMetadata)
-        assert meta.url == obj.pop("fw_binary_url")
-        assert meta.file_version == obj.pop("fw_file_version")
-        assert meta.file_size == obj.pop("fw_filesize")
-        assert meta.image_type == obj.pop("fw_image_type")
-        assert meta.manufacturer_id == obj.pop("fw_manufacturer_id")
-        assert meta.model_names == (obj.pop("model_id"),)
-        assert not obj
-
-
 async def test_inovelli_provider():
     index_json = (FILES_DIR / "inovelli_firmware-zha.json").read_text()
     index_obj = json.loads(index_json)

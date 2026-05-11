@@ -70,6 +70,10 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
         self._send_sequence = 0
         self._tasks: set[asyncio.Future[Any]] = set()
 
+        self._device_resolver: typing.Callable[
+            [zigpy.device.Device], zigpy.device.Device
+        ] = zigpy.quirks.get_device
+
         self._watchdog_task: asyncio.Task | None = None
 
         self._concurrent_requests_semaphore = RequestLimiter(
@@ -327,10 +331,18 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
 
     @classmethod
     async def new(
-        cls, config: dict, auto_form: bool = False, start_radio: bool = True
+        cls,
+        config: dict,
+        auto_form: bool = False,
+        start_radio: bool = True,
+        device_resolver: typing.Callable[[zigpy.device.Device], zigpy.device.Device]
+        | None = None,
     ) -> ControllerApplication:
         """Create new instance of application controller."""
         app = cls(config)
+
+        if device_resolver is not None:
+            app.register_device_resolver(device_resolver)
 
         await app._load_db()
 
@@ -606,12 +618,19 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
         device.original_signature = device.get_signature()
 
         self.listener_event("raw_device_initialized", device)
-        device = zigpy.quirks.get_device(device)
+        device = self._device_resolver(device)
         self.devices[device.ieee] = device
         if self._dblistener is not None:
             device.add_context_listener(self._dblistener)
 
         return device
+
+    def register_device_resolver(
+        self,
+        resolver: typing.Callable[[zigpy.device.Device], zigpy.device.Device],
+    ) -> None:
+        """Replace the device resolver used during `_finalize_device`."""
+        self._device_resolver = resolver
 
     def device_initialized(self, device: zigpy.device.Device) -> None:
         """Used by a device to signal that it is initialized"""

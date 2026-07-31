@@ -600,7 +600,7 @@ async def test_update_device_firmware(monkeypatch, dev, caplog):
             src_ep=1,
             dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
             dst_ep=1,
-            tsn=req_hdr.tsn,
+            aps_seq=req_hdr.tsn,
             profile_id=260,
             cluster_id=cluster.cluster_id,
             data=t.SerializableBytes(req_hdr.serialize() + req_cmd.serialize()),
@@ -751,7 +751,7 @@ async def test_update_device_firmware(monkeypatch, dev, caplog):
                         src_ep=1,
                         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
                         dst_ep=1,
-                        tsn=hdr.tsn,
+                        aps_seq=hdr.tsn,
                         profile_id=260,
                         cluster_id=cluster.cluster_id,
                         data=t.SerializableBytes(
@@ -1020,7 +1020,7 @@ async def test_update_legrand_device_firmware(monkeypatch, dev, caplog):
             src_ep=1,
             dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
             dst_ep=1,
-            tsn=req_hdr.tsn,
+            aps_seq=req_hdr.tsn,
             profile_id=260,
             cluster_id=cluster.cluster_id,
             data=t.SerializableBytes(req_hdr.serialize() + req_cmd.serialize()),
@@ -1170,7 +1170,7 @@ async def test_update_legrand_device_firmware(monkeypatch, dev, caplog):
                         src_ep=1,
                         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
                         dst_ep=1,
-                        tsn=hdr.tsn,
+                        aps_seq=hdr.tsn,
                         profile_id=260,
                         cluster_id=cluster.cluster_id,
                         data=t.SerializableBytes(
@@ -1402,7 +1402,7 @@ async def test_debouncing(dev):
         dst_ep=1,
         source_route=None,
         extended_timeout=False,
-        tsn=202,
+        aps_seq=202,
         profile_id=260,
         cluster_id=cluster.cluster_id,
         data=t.SerializableBytes(b"\t6\x02\x00\x89m\x02\x00\x04\x00\x00\x00\x00"),
@@ -1423,7 +1423,7 @@ async def test_debouncing(dev):
         for i in range(10):
             new_packet = packet.replace(
                 timestamp=None,
-                tsn=packet.tsn + i,
+                aps_seq=packet.aps_seq + i,
                 lqi=packet.lqi + i,
                 rssi=packet.rssi + i,
             )
@@ -1547,7 +1547,7 @@ async def test_duplicate_request_matching(dev: device.Device, caplog) -> None:
             src_ep=1,
             dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
             dst_ep=1,
-            tsn=1,
+            aps_seq=1,
             profile_id=260,
             cluster_id=Basic.cluster_id,
             data=t.SerializableBytes(
@@ -2332,7 +2332,7 @@ async def test_request_retry_failure(app) -> None:
         dst_ep=1,
         source_route=None,
         extended_timeout=False,
-        tsn=222,
+        aps_seq=1,
         profile_id=4660,
         cluster_id=6,
         data=t.SerializableBytes(b"test data"),
@@ -2341,21 +2341,26 @@ async def test_request_retry_failure(app) -> None:
         non_member_radius=0,
     )
 
+    # Each attempt is a new frame as far as the receiver is concerned, so the APS
+    # counter advances rather than marking the retries as duplicates
     assert app.send_packet.mock_calls == [
         call(packet),
         call(
             packet.replace(
-                tx_options=packet.tx_options | t.TransmitOptions.FORCE_ROUTE_DISCOVERY
+                tx_options=packet.tx_options | t.TransmitOptions.FORCE_ROUTE_DISCOVERY,
+                aps_seq=2,
             )
         ),
         call(
             packet.replace(
-                tx_options=packet.tx_options | t.TransmitOptions.FORCE_ROUTE_DISCOVERY
+                tx_options=packet.tx_options | t.TransmitOptions.FORCE_ROUTE_DISCOVERY,
+                aps_seq=3,
             )
         ),
         call(
             packet.replace(
-                tx_options=packet.tx_options | t.TransmitOptions.FORCE_ROUTE_DISCOVERY
+                tx_options=packet.tx_options | t.TransmitOptions.FORCE_ROUTE_DISCOVERY,
+                aps_seq=4,
             )
         ),
     ]

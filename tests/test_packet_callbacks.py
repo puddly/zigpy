@@ -14,7 +14,7 @@ def base_packet():
         src_ep=1,
         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
         dst_ep=1,
-        tsn=123,
+        aps_seq=123,
         profile_id=0x0104,
         cluster_id=0x0006,
         data=t.SerializableBytes(b"test"),
@@ -80,12 +80,12 @@ async def test_packet_callback_multiple_same_filter(app, base_packet):
     cb2 = MagicMock()
     cancel1 = app.register_packet_callback(addr, cb1)
     app.register_packet_callback(addr, cb2)
-    pkt1 = base_packet.replace(src=addr, tsn=200)
+    pkt1 = base_packet.replace(src=addr, aps_seq=200)
     app.notify_packet_callbacks(pkt1)
     assert cb1.mock_calls == [call(pkt1)]
     assert cb2.mock_calls == [call(pkt1)]
     cancel1()
-    pkt2 = base_packet.replace(src=addr, tsn=201)
+    pkt2 = base_packet.replace(src=addr, aps_seq=201)
     app.notify_packet_callbacks(pkt2)
     assert cb1.mock_calls == [call(pkt1)]
     assert cb2.mock_calls == [call(pkt1), call(pkt2)]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 from datetime import UTC, datetime
 import enum
+import functools
 import typing
 import warnings
 
@@ -13,6 +14,8 @@ from .struct import Struct
 
 if typing.TYPE_CHECKING:
     from typing import Self
+
+_T = typing.TypeVar("_T")
 
 
 class Bytes(bytes):
@@ -590,6 +593,32 @@ class PacketPriority(enum.IntEnum):
     LOW = -1
 
 
+def _accept_deprecated_tsn(cls: type[_T]) -> type[_T]:
+    """Keep the deprecated `tsn` constructor keyword working, as an `aps_seq` alias."""
+
+    # A property covers reads and writes, but the generated `__init__` binds its
+    # arguments by name and would reject `tsn` outright. Declaring `tsn` a field to make
+    # it bindable is what collides with the property, so the keyword is folded in here.
+    init = cls.__init__
+
+    @functools.wraps(init)
+    def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:
+        if "tsn" in kwargs:
+            kwargs["aps_seq"] = kwargs.pop("tsn")
+            warnings.warn(
+                "`ZigbeePacket.tsn` has been renamed to `ZigbeePacket.aps_seq`: it is"
+                " the APS counter, not the ZCL transaction sequence number",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        init(self, *args, **kwargs)
+
+    cls.__init__ = __init__  # type: ignore[method-assign]
+    return cls
+
+
+@_accept_deprecated_tsn
 @dataclasses.dataclass
 class ZigbeePacket(BaseDataclassMixin):
     """Container for the information in an incoming or outgoing ZDO or ZCL packet.
@@ -617,8 +646,12 @@ class ZigbeePacket(BaseDataclassMixin):
     source_route: list[NWK] | None = dataclasses.field(default=None)
     extended_timeout: bool = dataclasses.field(default=False)
 
-    # The APS counter, identifying this frame for the destination's duplicate rejection
-    # table and for correlating its APS ack.
+    # The APS counter, identifying this frame for the receiver's duplicate rejection
+    # table and for correlating its APS ack. Not the ZCL transaction sequence number:
+    # that lives in `data` and is reused by a response, while this is unique per frame.
+    # Radio libraries whose coprocessor assigns the counter itself can ignore it.
+    # Incoming, the counter the frame was received with, or `None` if the radio library
+    # cannot report it.
     aps_seq: basic.uint8_t | None = dataclasses.field(default=None)
 
     profile_id: basic.uint16_t = dataclasses.field(default=0x0000)
@@ -638,18 +671,26 @@ class ZigbeePacket(BaseDataclassMixin):
     lqi: basic.uint8_t | None = dataclasses.field(default=None)
     rssi: basic.int8s | None = dataclasses.field(default=None)
 
-    # Deprecated alias of `aps_seq`, accepted only by the constructor
-    tsn: dataclasses.InitVar[basic.uint8_t | None] = None
+    @property
+    def tsn(self) -> basic.uint8_t | None:
+        """Deprecated alias of `aps_seq`."""
+        warnings.warn(
+            "`ZigbeePacket.tsn` has been renamed to `ZigbeePacket.aps_seq`: it is the"
+            " APS counter, not the ZCL transaction sequence number",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.aps_seq
 
-    def __post_init__(self, tsn: basic.uint8_t | None) -> None:
-        if tsn is not None:
-            warnings.warn(
-                "`ZigbeePacket.tsn` has been renamed to `ZigbeePacket.aps_seq`: it is"
-                " the APS counter, not the ZCL transaction sequence number",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            self.aps_seq = tsn
+    @tsn.setter
+    def tsn(self, value: basic.uint8_t | None) -> None:
+        warnings.warn(
+            "`ZigbeePacket.tsn` has been renamed to `ZigbeePacket.aps_seq`: it is the"
+            " APS counter, not the ZCL transaction sequence number",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.aps_seq = value
 
     def __hash__(self) -> int:
         return hash(

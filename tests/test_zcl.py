@@ -1704,7 +1704,7 @@ async def test_received_onoff_toggle_generates_default_response():
                 src_ep=1,
                 dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
                 dst_ep=1,
-                tsn=req_hdr.tsn,
+                aps_seq=req_hdr.tsn,
                 profile_id=zigpy.profiles.zha.PROFILE_ID,
                 cluster_id=OnOff.cluster_id,
                 data=t.SerializableBytes(req_hdr.serialize() + req_cmd.serialize()),

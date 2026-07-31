@@ -305,7 +305,8 @@ async def test_group_request(group):
     )
     assert packet.profile_id is sentinel.profile
     assert packet.cluster_id is sentinel.cluster
-    assert packet.tsn is sentinel.sequence
+    # The APS counter is allocated per frame, independently of the ZCL sequence number
+    assert packet.aps_seq is group.application.get_aps_counter.return_value
     assert packet.data.serialize() == data
 
     assert res.status is zigpy.zcl.foundation.Status.SUCCESS

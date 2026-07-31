@@ -1738,11 +1738,11 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
         return self._send_sequence
 
     def get_aps_counter(self) -> t.uint8_t:
-        """Allocate an APS counter for a new outgoing frame."""
-        # One counter per APS entity, i.e. per node, not per device: the destination's
-        # duplicate rejection table is keyed on our address and this counter. Every
-        # retransmission of the same frame reuses it, so it is allocated once, when the
-        # packet is built, and survives the retries the packet goes through.
+        """Allocate an APS counter for an outgoing frame."""
+        # One counter per APS entity, i.e. per node rather than per device: the
+        # receiver's duplicate rejection table is keyed on our address and this counter.
+        # Every frame handed to the radio library gets its own, including each retry of a
+        # request, so a retried frame is a new frame as far as the receiver is concerned.
         self._aps_counter = (self._aps_counter + 1) % 256
         return t.uint8_t(self._aps_counter)
 

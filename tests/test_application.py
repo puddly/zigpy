@@ -821,7 +821,7 @@ def packet(app, device):
         src_ep=0x9A,
         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=device.nwk),
         dst_ep=0xBC,
-        tsn=0xDE,
+        aps_seq=1,
         profile_id=0x1234,
         cluster_id=0x0006,
         data=t.SerializableBytes(b"test data"),
@@ -856,26 +856,30 @@ async def test_request(app, device, packet):
     assert status == zigpy.zcl.foundation.Status.SUCCESS
     assert isinstance(msg, str)
 
-    app.send_packet.assert_called_once_with(
-        packet.replace(priority=t.PacketPriority.NORMAL)
-    )
+    # Every frame gets its own APS counter, so it advances with each send below
+    assert app.send_packet.mock_calls == [
+        call(packet.replace(priority=t.PacketPriority.NORMAL))
+    ]
     app.send_packet.reset_mock()
 
     # Test sending with IEEE
     await send_request(app, use_ieee=True)
-    app.send_packet.assert_called_once_with(
-        packet.replace(
-            src=t.AddrModeAddress(
-                addr_mode=t.AddrMode.IEEE,
-                address=app.state.node_info.ieee,
-            ),
-            dst=t.AddrModeAddress(
-                addr_mode=t.AddrMode.IEEE,
-                address=device.ieee,
-            ),
-            priority=t.PacketPriority.NORMAL,
+    assert app.send_packet.mock_calls == [
+        call(
+            packet.replace(
+                src=t.AddrModeAddress(
+                    addr_mode=t.AddrMode.IEEE,
+                    address=app.state.node_info.ieee,
+                ),
+                dst=t.AddrModeAddress(
+                    addr_mode=t.AddrMode.IEEE,
+                    address=device.ieee,
+                ),
+                aps_seq=2,
+                priority=t.PacketPriority.NORMAL,
+            )
         )
-    )
+    ]
     app.send_packet.reset_mock()
 
     # Test sending with source route
@@ -884,40 +888,58 @@ async def test_request(app, device, packet):
     with patch.dict(app.config, {conf.CONF_SOURCE_ROUTING: True}):
         await send_request(app)
 
-    app.build_source_route_to.assert_called_once_with(dest=device)
-    app.send_packet.assert_called_once_with(
-        packet.replace(source_route=[0x000A, 0x000B], priority=t.PacketPriority.NORMAL)
-    )
+    assert app.build_source_route_to.mock_calls == [call(dest=device)]
+    assert app.send_packet.mock_calls == [
+        call(
+            packet.replace(
+                source_route=[0x000A, 0x000B],
+                aps_seq=3,
+                priority=t.PacketPriority.NORMAL,
+            )
+        )
+    ]
     app.send_packet.reset_mock()
 
     # Test sending without waiting for a reply
     status, msg = await send_request(app, expect_reply=False)
 
-    app.send_packet.assert_called_once_with(
-        packet.replace(
-            tx_options=t.TransmitOptions.ACK, priority=t.PacketPriority.NORMAL
+    assert app.send_packet.mock_calls == [
+        call(
+            packet.replace(
+                tx_options=t.TransmitOptions.ACK,
+                aps_seq=4,
+                priority=t.PacketPriority.NORMAL,
+            )
         )
-    )
+    ]
     app.send_packet.reset_mock()
 
     # Test explicit ACK control (enabled)
     status, msg = await send_request(app, ask_for_ack=True)
 
-    app.send_packet.assert_called_once_with(
-        packet.replace(
-            tx_options=t.TransmitOptions.ACK, priority=t.PacketPriority.NORMAL
+    assert app.send_packet.mock_calls == [
+        call(
+            packet.replace(
+                tx_options=t.TransmitOptions.ACK,
+                aps_seq=5,
+                priority=t.PacketPriority.NORMAL,
+            )
         )
-    )
+    ]
     app.send_packet.reset_mock()
 
     # Test explicit ACK control (disabled)
     status, msg = await send_request(app, ask_for_ack=False)
 
-    app.send_packet.assert_called_once_with(
-        packet.replace(
-            tx_options=t.TransmitOptions(0), priority=t.PacketPriority.NORMAL
+    assert app.send_packet.mock_calls == [
+        call(
+            packet.replace(
+                tx_options=t.TransmitOptions(0),
+                aps_seq=6,
+                priority=t.PacketPriority.NORMAL,
+            )
         )
-    )
+    ]
     app.send_packet.reset_mock()
 
 
@@ -1048,7 +1070,7 @@ def zdo_packet(app, device):
         ),
         src_ep=0x00,  # ZDO
         dst_ep=0x00,
-        tsn=0xDE,
+        aps_seq=0xDE,
         profile_id=0x0000,
         cluster_id=0x0000,
         data=t.SerializableBytes(b""),
@@ -1075,7 +1097,7 @@ async def test_packet_received_new_device_zdo_announce(app, device, zdo_packet):
 
     zdo_packet.cluster_id = zdo_t.ZDOCmd.Device_annce
     zdo_packet.data = t.SerializableBytes(
-        t.uint8_t(zdo_packet.tsn).serialize() + zdo_data
+        t.uint8_t(zdo_packet.aps_seq).serialize() + zdo_data
     )
     app.packet_received(zdo_packet)
 
@@ -1121,7 +1143,7 @@ async def test_packet_received_new_device_discovery(app, device, zdo_packet):
 
         # Receive the IEEE address reply
         zdo_packet.data = t.SerializableBytes(
-            t.uint8_t(zdo_packet.tsn).serialize() + zdo_data
+            t.uint8_t(zdo_packet.aps_seq).serialize() + zdo_data
         )
         zdo_packet.cluster_id = zdo_t.ZDOCmd.IEEE_addr_rsp
         app.packet_received(zdo_packet)
@@ -1161,7 +1183,7 @@ async def test_packet_received_ieee_no_rejoin(app, device, zdo_packet, caplog):
 
     zdo_packet.cluster_id = zdo_t.ZDOCmd.IEEE_addr_rsp
     zdo_packet.data = t.SerializableBytes(
-        t.uint8_t(zdo_packet.tsn).serialize() + zdo_data
+        t.uint8_t(zdo_packet.aps_seq).serialize() + zdo_data
     )
     app.packet_received(zdo_packet)
 
@@ -1193,7 +1215,7 @@ async def test_packet_received_ieee_rejoin(app, device, zdo_packet, caplog):
 
     zdo_packet.cluster_id = zdo_t.ZDOCmd.IEEE_addr_rsp
     zdo_packet.data = t.SerializableBytes(
-        t.uint8_t(zdo_packet.tsn).serialize() + zdo_data
+        t.uint8_t(zdo_packet.aps_seq).serialize() + zdo_data
     )
     app.packet_received(zdo_packet)
 
@@ -1215,7 +1237,7 @@ async def test_bad_zdo_packet_received(app, device):
         src_ep=1,
         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
         dst_ep=0,  # bad destination endpoint
-        tsn=180,
+        aps_seq=180,
         profile_id=260,
         cluster_id=6,
         data=t.SerializableBytes(b"\x08n\n\x00\x00\x10\x00"),
@@ -1282,7 +1304,7 @@ async def test_request_future_matching(app, make_initialized_device):
         src_ep=1,
         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
         dst_ep=1,
-        tsn=req_hdr.tsn,
+        aps_seq=req_hdr.tsn,
         profile_id=260,
         cluster_id=ota.cluster_id,
         data=t.SerializableBytes(req_hdr.serialize() + req_cmd.serialize()),
@@ -1348,7 +1370,7 @@ async def test_request_callback_matching(app, make_initialized_device):
         src_ep=1,
         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
         dst_ep=1,
-        tsn=req_hdr.tsn,
+        aps_seq=req_hdr.tsn,
         profile_id=260,
         cluster_id=ota.cluster_id,
         data=t.SerializableBytes(req_hdr.serialize() + req_cmd.serialize()),

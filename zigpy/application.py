@@ -76,6 +76,7 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
         self._dblistener = None
         self._groups = zigpy.group.Groups(self)
         self._send_sequence = 0
+        self._aps_counter = 0
         self._tasks: set[asyncio.Future[Any]] = set()
 
         self._device_resolver: (
@@ -1146,7 +1147,7 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
                 src_ep=src_ep,
                 dst=dst,
                 dst_ep=dst_ep,
-                tsn=sequence,
+                aps_seq=self.get_aps_counter(),
                 profile_id=profile,
                 cluster_id=cluster,
                 data=t.SerializableBytes(data),
@@ -1193,7 +1194,7 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
                 ),
                 src_ep=src_ep,
                 dst=t.AddrModeAddress(addr_mode=t.AddrMode.Group, address=group_id),
-                tsn=sequence,
+                aps_seq=self.get_aps_counter(),
                 profile_id=profile,
                 cluster_id=cluster,
                 data=t.SerializableBytes(data),
@@ -1242,7 +1243,7 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
                     addr_mode=t.AddrMode.Broadcast, address=broadcast_address
                 ),
                 dst_ep=dst_ep,
-                tsn=sequence,
+                aps_seq=self.get_aps_counter(),
                 profile_id=profile,
                 cluster_id=cluster,
                 data=t.SerializableBytes(data),
@@ -1735,6 +1736,15 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
     def get_sequence(self) -> int:
         self._send_sequence = (self._send_sequence + 1) % 256
         return self._send_sequence
+
+    def get_aps_counter(self) -> t.uint8_t:
+        """Allocate an APS counter for a new outgoing frame."""
+        # One counter per APS entity, i.e. per node, not per device: the destination's
+        # duplicate rejection table is keyed on our address and this counter. Every
+        # retransmission of the same frame reuses it, so it is allocated once, when the
+        # packet is built, and survives the retries the packet goes through.
+        self._aps_counter = (self._aps_counter + 1) % 256
+        return t.uint8_t(self._aps_counter)
 
     def get_device(
         self, ieee: t.EUI64 = None, nwk: t.NWK | int = None

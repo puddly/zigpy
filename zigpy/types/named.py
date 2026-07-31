@@ -4,6 +4,7 @@ import dataclasses
 from datetime import UTC, datetime
 import enum
 import typing
+import warnings
 
 import attrs
 
@@ -616,7 +617,10 @@ class ZigbeePacket(BaseDataclassMixin):
     source_route: list[NWK] | None = dataclasses.field(default=None)
     extended_timeout: bool = dataclasses.field(default=False)
 
-    tsn: basic.uint8_t = dataclasses.field(default=0x00)
+    # The APS counter, identifying this frame for the destination's duplicate rejection
+    # table and for correlating its APS ack.
+    aps_seq: basic.uint8_t | None = dataclasses.field(default=None)
+
     profile_id: basic.uint16_t = dataclasses.field(default=0x0000)
     cluster_id: basic.uint16_t = dataclasses.field(default=0x0000)
 
@@ -634,6 +638,19 @@ class ZigbeePacket(BaseDataclassMixin):
     lqi: basic.uint8_t | None = dataclasses.field(default=None)
     rssi: basic.int8s | None = dataclasses.field(default=None)
 
+    # Deprecated alias of `aps_seq`, accepted only by the constructor
+    tsn: dataclasses.InitVar[basic.uint8_t | None] = None
+
+    def __post_init__(self, tsn: basic.uint8_t | None) -> None:
+        if tsn is not None:
+            warnings.warn(
+                "`ZigbeePacket.tsn` has been renamed to `ZigbeePacket.aps_seq`: it is"
+                " the APS counter, not the ZCL transaction sequence number",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.aps_seq = tsn
+
     def __hash__(self) -> int:
         return hash(
             (
@@ -644,7 +661,7 @@ class ZigbeePacket(BaseDataclassMixin):
                 self.dst_ep,
                 self.source_route,
                 self.extended_timeout,
-                self.tsn,
+                self.aps_seq,
                 self.profile_id,
                 self.cluster_id,
                 self.data,

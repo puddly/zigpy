@@ -68,7 +68,7 @@ class Group(ListenableMixin, dict):
                 dst=t.AddrModeAddress(
                     addr_mode=t.AddrMode.Group, address=self.group_id
                 ),
-                tsn=sequence,
+                aps_seq=self.application.get_aps_counter(),
                 profile_id=profile,
                 cluster_id=cluster,
                 data=t.SerializableBytes(data),

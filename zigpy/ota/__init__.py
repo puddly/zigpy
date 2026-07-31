@@ -754,7 +754,7 @@ class OTA:
                     address=broadcast_address,
                 ),
                 dst_ep=0xFF,
-                tsn=tsn,
+                aps_seq=self._application.get_aps_counter(),
                 profile_id=zigpy.profiles.zha.PROFILE_ID,
                 cluster_id=Ota.cluster_id,
                 data=t.SerializableBytes(hdr.serialize() + request.serialize()),

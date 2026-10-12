@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 import contextlib
 from datetime import UTC, datetime, timedelta
 import json
@@ -64,7 +64,6 @@ DB_V = f"_v{DB_VERSION}"
 
 UNIX_EPOCH = datetime.fromtimestamp(0, tz=UTC)
 DB_V_REGEX = re.compile(r"(?:_v\d+)?$")
-DML_REGEX = re.compile(r"\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
 
 MIN_UPDATE_DELTA = timedelta(seconds=30).total_seconds()
 
@@ -97,17 +96,23 @@ def _convert_binding(cursor: apsw.Cursor, num: int, value: Any) -> str:
     raise TypeError(f"Unsupported SQLite binding {value!r}")
 
 
+def _convert_value(decltype: str | None, value: apsw.SQLiteValue) -> Any:
+    if decltype == "ieee" and value is not None:
+        assert isinstance(value, str)
+        return t.EUI64.convert(value)
+
+    return value
+
+
 def _convert_row(cursor: apsw.Cursor, row: apsw.SQLiteValues) -> tuple[Any, ...]:
     return tuple(
-        t.EUI64.convert(value) if decltype == "ieee" and value is not None else value
+        _convert_value(decltype, value)
         for (_, decltype), value in zip(cursor.get_description(), row, strict=True)
     )
 
 
 class DaemonAsyncIO(apsw.aio.AsyncIO):
-    """apsw asyncio controller with a daemon worker thread, which cannot block
-    interpreter shutdown if the connection is never closed.
-    """
+    """apsw asyncio controller whose worker thread cannot block interpreter exit."""
 
     def __init__(self, *, thread_name: str = "zigpy apsw worker") -> None:
         # Mirrors `apsw.aio.AsyncIO.__init__`
@@ -119,73 +124,16 @@ class DaemonAsyncIO(apsw.aio.AsyncIO):
         self.thread.start()
 
 
-class Connection(apsw.Connection):
-    """Async apsw connection emulating the `sqlite3` module's legacy transaction
-    control: DML statements implicitly begin a transaction.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        # Async connections run `__init__` in the worker thread
-        super().__init__(*args, **kwargs)
-        self.convert_binding = _convert_binding
-        self.row_trace = _convert_row
-
-    def _begin_implicitly(self, sql: str) -> None:
-        if self.get_autocommit() and DML_REGEX.match(sql):
-            self.execute("BEGIN")
-
-    def _execute_legacy(self, sql: str, bindings: apsw.Bindings | None) -> apsw.Cursor:
-        self._begin_implicitly(sql)
-        return self.execute(sql, bindings)
-
-    def _executemany_legacy(
-        self, sql: str, bindings: list[apsw.Bindings]
-    ) -> apsw.Cursor:
-        self._begin_implicitly(sql)
-        return self.executemany(sql, bindings)
-
-    def _commit(self) -> None:
-        if not self.get_autocommit():
-            self.execute("COMMIT")
-
-    def _rollback(self) -> None:
-        if not self.get_autocommit():
-            self.execute("ROLLBACK")
-
-    async def execute_legacy(
-        self, sql: str, bindings: apsw.Bindings | None = None
-    ) -> apsw.Cursor:
-        return await self.async_run(self._execute_legacy, sql, bindings)
-
-    async def executemany_legacy(
-        self, sql: str, bindings: list[apsw.Bindings]
-    ) -> apsw.Cursor:
-        return await self.async_run(self._executemany_legacy, sql, bindings)
-
-    async def commit(self) -> None:
-        await self.async_run(self._commit)
-
-    async def rollback(self) -> None:
-        await self.async_run(self._rollback)
+def _begin_transaction(db: apsw.Connection) -> None:
+    """Begin a transaction if none is open. Runs in the worker thread, so it's atomic."""
+    if db.get_autocommit():
+        db.execute("BEGIN")
 
 
-class CursorContext:
-    """Allows both `await execute(...)` and `async with execute(...) as cursor`."""
-
-    def __init__(self, coro: Coroutine[Any, Any, apsw.Cursor]) -> None:
-        self._coro = coro
-        self._cursor: apsw.Cursor | None = None
-
-    def __await__(self):
-        return self._coro.__await__()
-
-    async def __aenter__(self) -> apsw.Cursor:
-        self._cursor = await self._coro
-        return self._cursor
-
-    async def __aexit__(self, *exc_info) -> None:
-        assert self._cursor is not None
-        await self._cursor.aclose()
+def _commit_transaction(db: apsw.Connection) -> None:
+    """Commit the open transaction, if any. Runs in the worker thread, so it's atomic."""
+    if not db.get_autocommit():
+        db.execute("COMMIT")
 
 
 def decode_str_attribute(value: str | bytes) -> str:
@@ -198,11 +146,14 @@ def decode_str_attribute(value: str | bytes) -> str:
 class PersistingListener(zigpy.util.CatchingTaskMixin):
     def __init__(
         self,
-        connection: Connection,
+        connection: apsw.AsyncConnection,
         application: ControllerApplication,
     ) -> None:
+        controller = connection.async_controller
+        assert isinstance(controller, DaemonAsyncIO)
+
         self._db = connection
-        self._db_thread = connection.async_controller.thread
+        self._db_thread = controller.thread
         self._application = application
         self._callback_handlers: asyncio.Queue = asyncio.Queue()
         self.running = False
@@ -212,22 +163,22 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self._commit_task: asyncio.Task | None = None
 
     async def initialize_tables(self) -> None:
-        async with self.execute("PRAGMA integrity_check") as cursor:
+        async with self._query("PRAGMA integrity_check") as cursor:
             rows = await cursor.fetchall()
-            status = "\n".join(row[0] for row in rows)
+        status = "\n".join(row[0] for row in rows)
 
-            if status != "ok":
-                LOGGER.error(
-                    "Zigbee database is corrupted, integrity check failed!\n%s", status
-                )
+        if status != "ok":
+            LOGGER.error(
+                "Zigbee database is corrupted, integrity check failed!\n%s", status
+            )
 
-        async with self.execute("PRAGMA foreign_key_check") as cursor:
+        async with self._query("PRAGMA foreign_key_check") as cursor:
             rows = await cursor.fetchall()
 
-            if rows:
-                LOGGER.error(
-                    "Zigbee database is corrupted, foreign key check failed!\n%s", rows
-                )
+        if rows:
+            LOGGER.error(
+                "Zigbee database is corrupted, foreign key check failed!\n%s", rows
+            )
 
         # Truncate the SQLite journal file instead of deleting it after transactions
         await self.execute("PRAGMA journal_mode = WAL")
@@ -241,8 +192,14 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         cls, database_file: str, app: ControllerApplication
     ) -> PersistingListener:
         """Create an instance of persisting listener."""
-        with apsw.aio.contextvar_set(apsw.async_controller, DaemonAsyncIO):
-            connection = await Connection.as_async(str(database_file))
+        # apsw's stubs declare `async_controller` as a type, not a `ContextVar`
+        with apsw.aio.contextvar_set(apsw.async_controller, DaemonAsyncIO):  # type: ignore[arg-type,attr-defined]
+            connection = await apsw.Connection.as_async(str(database_file))
+
+        await connection.async_run(
+            setattr, connection, "convert_binding", _convert_binding
+        )
+        await connection.async_run(setattr, connection, "row_trace", _convert_row)
 
         listener = cls(connection, app)
 
@@ -285,7 +242,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         """
         if force or self._commit_interval <= 0:
             try:
-                await self._db.commit()
+                await self._db.async_run(_commit_transaction, self._db)
             except Exception:
                 # Retry the uncommitted writes after another interval
                 if self._commit_interval > 0:
@@ -308,11 +265,8 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     async def _flush_commit(self) -> None:
         """Commit any open transaction, invoked by the worker after the delay."""
-        if not await self._db.in_transaction:
-            return
-
         try:
-            await self._db.commit()
+            await self._db.async_run(_commit_transaction, self._db)
         except Exception:
             LOGGER.exception("Failed to flush pending database commits")
             self._arm_commit_timer()
@@ -329,12 +283,11 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             self._commit_task = None
 
         try:
-            if await self._db.in_transaction:
-                try:
-                    await self._db.commit()
-                except Exception:
-                    LOGGER.exception("Failed to commit pending changes during shutdown")
-                    await self._db.rollback()
+            try:
+                await self._db.async_run(_commit_transaction, self._db)
+            except Exception:
+                LOGGER.exception("Failed to commit pending changes during shutdown")
+                await self._db.execute("ROLLBACK")
 
             # Delete the journal on shutdown
             await self.execute("PRAGMA wal_checkpoint;")
@@ -367,30 +320,35 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             return
         self._callback_handlers.put_nowait((cb_name, args))
 
-    def execute(self, sql: str, bindings: apsw.Bindings | None = None) -> CursorContext:
-        return CursorContext(self._db.execute_legacy(sql, bindings))
+    async def _begin(self) -> None:
+        """Begin a transaction for a handler's writes, unless one is already open."""
+        await self._db.async_run(_begin_transaction, self._db)
 
-    async def executemany(self, sql: str, bindings: list[apsw.Bindings]) -> None:
-        await self._db.executemany_legacy(sql, bindings)
+    # Bindings are `Any`: `_convert_binding` handles types apsw doesn't know about
+    async def execute(
+        self, sql: str, bindings: Sequence[Any] | Mapping[str, Any] | None = None
+    ) -> apsw.AsyncCursor:
+        return await self._db.execute(sql, bindings)
 
-    async def executescript(self, sql):
-        """Naive replacement for `sqlite3.Cursor.executescript` that does not execute a
-        `COMMIT` before running the script. This extra `COMMIT` breaks transactions that
-        run scripts.
-        """
+    async def executemany(
+        self, sql: str, bindings: Iterable[Sequence[Any] | Mapping[str, Any]]
+    ) -> None:
+        await self._db.executemany(sql, bindings)
 
-        # XXX: This will break if you use a semicolon anywhere but at the end of a line
-        for statement in sql.split(";"):
-            # Strip SQL comments so that the implicit transaction DML detection (which
-            # doesn't skip comments) sees the actual statement keyword
-            statement = re.sub(r"--[^\n]*", "", statement)
-
-            await self.execute(statement)
+    @contextlib.asynccontextmanager
+    async def _query(
+        self, sql: str, bindings: Sequence[Any] | Mapping[str, Any] | None = None
+    ) -> AsyncIterator[Any]:
+        """Execute a query, resetting its statement on exit even if rows remain."""
+        # The cursor is `Any` because `_convert_row` changes its row types
+        async with contextlib.aclosing(await self.execute(sql, bindings)) as cursor:
+            yield cursor
 
     def device_joined(self, device: Device) -> None:
         self.enqueue("_update_device_nwk", device.ieee, device.nwk)
 
     async def _update_device_nwk(self, ieee: t.EUI64, nwk: t.NWK) -> None:
+        await self._begin()
         await self.execute(f"UPDATE devices{DB_V} SET nwk=? WHERE ieee=?", (nwk, ieee))
         await self._commit(force=True)
 
@@ -405,6 +363,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_save_device_last_seen", device.ieee, last_seen)
 
     async def _save_device_last_seen(self, ieee: t.EUI64, last_seen: datetime) -> None:
+        await self._begin()
         q = f"""UPDATE devices{DB_V}
                     SET last_seen=:ts
                     WHERE ieee=:ieee AND :ts - last_seen > :min_update_delta"""
@@ -423,6 +382,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_save_device_relays", device.ieee, relays)
 
     async def _save_device_relays(self, ieee: t.EUI64, relays: t.Relays | None) -> None:
+        await self._begin()
         if relays is None:
             await self.execute(f"DELETE FROM relays{DB_V} WHERE ieee = ?", (ieee,))
         else:
@@ -440,6 +400,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _neighbors_updated(
         self, ieee: t.EUI64, neighbors: list[zdo_t.Neighbor]
     ) -> None:
+        await self._begin()
         await self.execute(f"DELETE FROM neighbors{DB_V} WHERE device_ieee = ?", [ieee])
 
         rows = [(ieee, *neighbor.as_tuple()) for neighbor in neighbors]
@@ -454,6 +415,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_routes_updated", ieee, routes)
 
     async def _routes_updated(self, ieee: t.EUI64, routes: list[zdo_t.Route]) -> None:
+        await self._begin()
         await self.execute(f"DELETE FROM routes{DB_V} WHERE device_ieee = ?", [ieee])
 
         rows = [(ieee, *route.as_tuple()) for route in routes]
@@ -468,6 +430,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_group_added", group)
 
     async def _group_added(self, group: zigpy.group.Group) -> None:
+        await self._begin()
         q = f"""INSERT INTO groups{DB_V} VALUES (?, ?)
                     ON CONFLICT (group_id)
                     DO UPDATE SET name=excluded.name"""
@@ -479,6 +442,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_group_member_added", group, ep)
 
     async def _group_member_added(self, group: zigpy.group.Group, ep: Endpoint) -> None:
+        await self._begin()
         q = f"""INSERT INTO group_members{DB_V} VALUES (?, ?, ?)
                     ON CONFLICT
                     DO NOTHING"""
@@ -492,6 +456,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _group_member_removed(
         self, group: zigpy.group.Group, ep: Endpoint
     ) -> None:
+        await self._begin()
         q = f"""DELETE FROM group_members{DB_V} WHERE group_id=?
                                                 AND ieee=?
                                                 AND endpoint_id=?"""
@@ -503,6 +468,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_group_removed", group)
 
     async def _group_removed(self, group: zigpy.group.Group) -> None:
+        await self._begin()
         q = f"DELETE FROM groups{DB_V} WHERE group_id=?"
         await self.execute(q, (group.group_id,))
         await self._commit(force=True)
@@ -511,6 +477,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_remove_device", device)
 
     async def _remove_device(self, device: Device) -> None:
+        await self._begin()
         await self.execute(f"DELETE FROM devices{DB_V} WHERE ieee = ?", (device.ieee,))
         await self._commit(force=True)
 
@@ -532,6 +499,8 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         # quirk had a chance to mutate the live device
         if device.original_signature is not None:
             raise ValueError("A device with quirks cannot be saved to the database")
+
+        await self._begin()
 
         q = f"""INSERT INTO devices{DB_V} (ieee, nwk, status, last_seen)
                     VALUES (?, ?, ?, ?)
@@ -721,6 +690,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             LOGGER.debug("Ignoring failed attribute write event: %s", event)
             return
 
+        await self._begin()
         await self.execute(
             f"""
             INSERT INTO attributes_cache{DB_V} (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code, status, value, last_updated)
@@ -752,6 +722,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_clear_attribute", event)
 
     async def _clear_attribute(self, event: AttributeClearedEvent) -> None:
+        await self._begin()
         q = f"""
             DELETE FROM attributes_cache{DB_V}
             WHERE
@@ -782,6 +753,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _unsupported_attribute_added(
         self, event: AttributeUnsupportedEvent
     ) -> None:
+        await self._begin()
         q = f"""INSERT INTO attributes_cache{DB_V} (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code, status, value, last_updated)
                    VALUES (:ieee, :endpoint_id, :cluster_type, :cluster_id, :attr_id, :manufacturer_code, :status, :value, :timestamp)
                    ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx)
@@ -809,6 +781,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _save_ota_query_cache_entry(
         self, event: OtaQueryCacheUpdatedEvent
     ) -> None:
+        await self._begin()
         q = f"""INSERT INTO ota_query_cache{DB_V}
                     (ieee, endpoint_id, manufacturer_code, image_type,
                      current_file_version, hardware_version, last_updated)
@@ -840,6 +813,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _delete_ota_query_cache_entry(
         self, event: OtaQueryCacheClearedEvent
     ) -> None:
+        await self._begin()
         await self.execute(
             f"DELETE FROM ota_query_cache{DB_V} WHERE ieee = ? AND endpoint_id = ?",
             (event.device_ieee, event.endpoint_id),
@@ -850,6 +824,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_network_backup_created", json.dumps(backup.as_dict()))
 
     async def _network_backup_created(self, backup_json: str) -> None:
+        await self._begin()
         q = f"""INSERT INTO network_backups{DB_V} VALUES (?, ?)
                     ON CONFLICT (id)
                     DO UPDATE SET
@@ -862,6 +837,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_network_backup_removed", backup.backup_time)
 
     async def _network_backup_removed(self, backup_time: datetime) -> None:
+        await self._begin()
         q = f"""DELETE FROM network_backups{DB_V}
                     WHERE json_extract(backup_json, '$.backup_time')=?"""
 
@@ -872,7 +848,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self,
     ) -> list[AttributeCacheRow]:
         """Read all attribute rows from the database."""
-        async with self.execute(
+        async with self._query(
             f"""
             SELECT ieee, endpoint_id, cluster_type, cluster_id, attr_id,
                    manufacturer_code, status, value, last_updated
@@ -918,7 +894,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         # Second pass: populate the attribute cache for the final device state and
         # migrate attributes with unknown manufacturer codes to the correct codes. Only
         # the migration pass modifies the database so we do it in a transaction.
-        async with self._transaction():
+        async with self._db:
             await self._populate_attribute_cache(all_attributes, migrate=True)
 
         await self._load_groups()
@@ -1031,7 +1007,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         },
                     )
 
-                    async with self.execute(
+                    await self.execute(
                         f"""
                         INSERT OR IGNORE INTO attributes_cache{DB_V}
                             (ieee, endpoint_id, cluster_type, cluster_id,
@@ -1049,10 +1025,11 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                             "value": row.value,
                             "last_updated": row.last_updated,
                         },
-                    ):
-                        # A resolved row already exists, it will populate the cache
-                        if await self._db.changes() == 0:
-                            continue
+                    )
+
+                    # A resolved row already exists, it will populate the cache
+                    if await self._db.changes() == 0:
+                        continue
 
             try:
                 attr_def = cluster.find_attribute(
@@ -1154,7 +1131,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         return cluster._get_effective_manufacturer_code(attr_def)
 
     async def _load_devices(self) -> None:
-        async with self.execute(f"SELECT * FROM devices{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM devices{DB_V}") as cursor:
             async for ieee, nwk, status, last_seen in cursor:
                 dev = self._application.add_device(ieee, nwk)
                 dev.status = DeviceStatus(status)
@@ -1163,14 +1140,14 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     dev.last_seen = last_seen
 
     async def _load_node_descriptors(self) -> None:
-        async with self.execute(f"SELECT * FROM node_descriptors{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM node_descriptors{DB_V}") as cursor:
             async for ieee, *fields in cursor:
                 dev = self._get_zigbee_device(ieee)
                 dev.node_desc = zdo_t.NodeDescriptor(*fields)
                 assert dev.node_desc.is_valid
 
     async def _load_endpoints(self) -> None:
-        async with self.execute(f"SELECT * FROM endpoints{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM endpoints{DB_V}") as cursor:
             async for ieee, epid, profile_id, device_type, status in cursor:
                 dev = self._get_zigbee_device(ieee)
                 ep = dev.add_endpoint(epid)
@@ -1185,7 +1162,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     ep.device_type = device_type
 
     async def _load_clusters(self) -> None:
-        async with self.execute(f"SELECT * FROM clusters{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM clusters{DB_V}") as cursor:
             async for ieee, endpoint_id, cluster_type, cluster_id in cursor:
                 dev = self._get_zigbee_device(ieee)
                 ep = dev.endpoints[endpoint_id]
@@ -1196,32 +1173,32 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     ep.add_output_cluster(cluster_id)
 
     async def _load_groups(self) -> None:
-        async with self.execute(f"SELECT * FROM groups{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM groups{DB_V}") as cursor:
             async for group_id, name in cursor:
                 self._application.groups.add_group(group_id, name, suppress_event=True)
 
     async def _load_group_members(self) -> None:
-        async with self.execute(f"SELECT * FROM group_members{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM group_members{DB_V}") as cursor:
             async for group_id, ieee, ep_id in cursor:
                 dev = self._get_zigbee_device(ieee)
                 group = self._application.groups[group_id]
                 group.add_member(dev.endpoints[ep_id], suppress_event=True)
 
     async def _load_relays(self) -> None:
-        async with self.execute(f"SELECT * FROM relays{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM relays{DB_V}") as cursor:
             async for ieee, value in cursor:
                 dev = self._get_zigbee_device(ieee)
                 relays, _ = t.Relays.deserialize(value)
                 dev.relays = zigpy.util.filter_relays(relays)
 
     async def _load_neighbors(self) -> None:
-        async with self.execute(f"SELECT * FROM neighbors{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM neighbors{DB_V}") as cursor:
             async for ieee, *fields in cursor:
                 neighbor = zdo_t.Neighbor(*fields)
                 self._application.topology.neighbors[ieee].append(neighbor)
 
     async def _load_routes(self) -> None:
-        async with self.execute(f"SELECT * FROM routes{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM routes{DB_V}") as cursor:
             async for ieee, *fields in cursor:
                 route = zdo_t.Route(*fields)
                 self._application.topology.routes[ieee].append(route)
@@ -1229,7 +1206,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _load_network_backups(self) -> None:
         self._application.backups.backups.clear()
 
-        async with self.execute(
+        async with self._query(
             f"SELECT * FROM network_backups{DB_V} ORDER BY id"
         ) as cursor:
             backups = []
@@ -1244,7 +1221,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             self._application.backups.add_backup(backup, suppress_event=True)
 
     async def _load_ota_query_cache(self) -> None:
-        async with self.execute(f"SELECT * FROM ota_query_cache{DB_V}") as cursor:
+        async with self._query(f"SELECT * FROM ota_query_cache{DB_V}") as cursor:
             async for (
                 ieee,
                 endpoint_id,
@@ -1288,22 +1265,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         for dev in self._application.devices.values():
             dev.add_context_listener(self)
 
-    @contextlib.asynccontextmanager
-    async def _transaction(self):
-        await self.execute("BEGIN TRANSACTION")
-
-        try:
-            yield
-        except Exception:  # noqa: BLE001
-            await self.execute("ROLLBACK")
-            raise
-        else:
-            await self.execute("COMMIT")
-
     async def _get_table_versions(self) -> dict[str, int]:
         tables = {}
 
-        async with self.execute(
+        async with self._query(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ) as cursor:
             async for (name,) in cursor:
@@ -1328,7 +1293,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         tables = await self._get_table_versions()
         tables_version = max(tables.values(), default=0)
 
-        async with self.execute("PRAGMA user_version") as cursor:
+        async with self._query("PRAGMA user_version") as cursor:
             (db_version,) = await cursor.fetchone()
 
         LOGGER.debug(
@@ -1349,7 +1314,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         if db_version == 0 and not tables:
             # If this is a brand new database, just load the current schema
-            await self.executescript(zigpy.appdb_schemas.SCHEMAS[DB_VERSION])
+            await self.execute(zigpy.appdb_schemas.SCHEMAS[DB_VERSION])
             return False
         elif db_version > DB_VERSION:
             LOGGER.error(
@@ -1362,7 +1327,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             return False
 
         # All migrations must succeed. If any fail, the database is not touched.
-        async with self._transaction():
+        async with self._db:
             for migration, to_db_version in [
                 (self._migrate_to_v4, 4),
                 (self._migrate_to_v5, 5),
@@ -1383,7 +1348,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 LOGGER.info(
                     "Migrating database from v%d to v%d", db_version, to_db_version
                 )
-                await self.executescript(zigpy.appdb_schemas.SCHEMAS[to_db_version])
+                await self.execute(zigpy.appdb_schemas.SCHEMAS[to_db_version])
                 await migration()
 
                 db_version = to_db_version
@@ -1417,7 +1382,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 continue
 
             # Use explicit column names to skip generated columns automatically
-            async with self.execute(f"PRAGMA table_info({old_table})") as cursor:
+            async with self._query(f"PRAGMA table_info({old_table})") as cursor:
                 columns = [row[1] async for row in cursor]
 
             col_list = ", ".join(columns)
@@ -1425,7 +1390,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             select_sql = f"SELECT {col_list} FROM {old_table}"
             insert_sql = f"INSERT INTO {new_table} ({col_list}) VALUES ({placeholders})"
 
-            async with self.execute(select_sql) as cursor:
+            async with self._query(select_sql) as cursor:
                 async for row in cursor:
                     try:
                         await self.execute(insert_sql, row)
@@ -1447,7 +1412,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         """Schema v4 expanded the node descriptor and neighbor table columns"""
         # The `node_descriptors` table was added in v1
         if await self._table_exists("node_descriptors"):
-            async with self.execute("SELECT * FROM node_descriptors") as cur:
+            async with self._query("SELECT * FROM node_descriptors") as cur:
                 async for dev_ieee, value in cur:
                     node_desc, rest = zdo_t.NodeDescriptor.deserialize(value)
                     assert not rest
@@ -1461,7 +1426,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         # The `neighbors` table was added in v3 but the version number was not
         # incremented. It may not exist.
         if await self._table_exists("neighbors"):
-            async with self.execute("SELECT * FROM neighbors") as cur:
+            async with self._query("SELECT * FROM neighbors") as cur:
                 async for dev_ieee, epid, ieee, nwk, packed, prm, depth, lqi in cur:
                     neighbor = zdo_t.Neighbor(
                         extended_pan_id=epid,
@@ -1522,10 +1487,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         # See if we can migrate any `attributes_cache` rows skipped by the v5 migration
         if await self._table_exists("attributes"):
-            async with self.execute("SELECT count(*) FROM attributes") as cur:
+            async with self._query("SELECT count(*) FROM attributes") as cur:
                 (num_attrs_v4,) = await cur.fetchone()
 
-            async with self.execute("SELECT count(*) FROM attributes_cache_v6") as cur:
+            async with self._query("SELECT count(*) FROM attributes_cache_v6") as cur:
                 (num_attrs_v6,) = await cur.fetchone()
 
             if num_attrs_v6 < num_attrs_v4:
@@ -1571,7 +1536,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _migrate_to_v8(self):
         """Schema v8 added the `devices_v8.last_seen` column."""
 
-        async with self.execute("SELECT * FROM devices_v7") as cursor:
+        async with self._query("SELECT * FROM devices_v7") as cursor:
             async for ieee, nwk, status in cursor:
                 # Set the default `last_seen` to the unix epoch
                 await self.execute(
@@ -1680,7 +1645,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             }
         )
 
-        async with self.execute("SELECT * FROM attributes_cache_v11") as cursor:
+        async with self._query("SELECT * FROM attributes_cache_v11") as cursor:
             async for ieee, endpoint_id, cluster_id, attrid, value in cursor:
                 # Set the default `last_updated` to the unix epoch
                 await self.execute(
@@ -1709,28 +1674,28 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             }
         )
 
-        async with self.execute("SELECT * FROM in_clusters_v12") as cursor:
+        async with self._query("SELECT * FROM in_clusters_v12") as cursor:
             async for ieee, endpoint_id, cluster_id in cursor:
                 await self.execute(
                     "INSERT INTO clusters_v13 VALUES (?, ?, ?, ?)",
                     (ieee, endpoint_id, ClusterType.Server, cluster_id),
                 )
 
-        async with self.execute("SELECT * FROM out_clusters_v12") as cursor:
+        async with self._query("SELECT * FROM out_clusters_v12") as cursor:
             async for ieee, endpoint_id, cluster_id in cursor:
                 await self.execute(
                     "INSERT INTO clusters_v13 VALUES (?, ?, ?, ?)",
                     (ieee, endpoint_id, ClusterType.Client, cluster_id),
                 )
 
-        async with self.execute("SELECT * FROM unsupported_attributes_v12") as cursor:
+        async with self._query("SELECT * FROM unsupported_attributes_v12") as cursor:
             async for ieee, endpoint_id, cluster_id, attrid in cursor:
                 await self.execute(
                     "INSERT INTO unsupported_attributes_v13 VALUES (?, ?, ?, ?, ?)",
                     (ieee, endpoint_id, ClusterType.Server, cluster_id, attrid),
                 )
 
-        async with self.execute("SELECT * FROM attributes_cache_v12") as cursor:
+        async with self._query("SELECT * FROM attributes_cache_v12") as cursor:
             async for (
                 ieee,
                 endpoint_id,
@@ -1772,7 +1737,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         )
 
         # Migrate unsupported attributes into the attributes cache with status
-        async with self.execute("SELECT * FROM unsupported_attributes_v13") as cursor:
+        async with self._query("SELECT * FROM unsupported_attributes_v13") as cursor:
             async for (
                 ieee,
                 endpoint_id,
@@ -1795,7 +1760,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     ),
                 )
 
-        async with self.execute("SELECT * FROM attributes_cache_v13") as cursor:
+        async with self._query("SELECT * FROM attributes_cache_v13") as cursor:
             async for (
                 ieee,
                 endpoint_id,

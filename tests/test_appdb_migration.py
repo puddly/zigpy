@@ -1,4 +1,3 @@
-import asyncio
 from datetime import UTC, datetime
 import logging
 import pathlib
@@ -450,8 +449,10 @@ async def test_v5_to_v7_migration(test_db):
 
 async def test_migration_missing_tables(app):
     conn = MagicMock()
+    conn.async_controller = MagicMock(spec=zigpy.appdb.DaemonAsyncIO)
+    conn.async_controller.thread = MagicMock()
+    conn.async_run = AsyncMock()
     conn.aclose = AsyncMock()
-    conn.in_transaction = asyncio.sleep(0, result=False)
 
     appdb = zigpy.appdb.PersistingListener(conn, app)
 
@@ -459,10 +460,8 @@ async def test_migration_missing_tables(app):
         return_value={"table1_v1": "1", "table1": "", "table2_v1": "1"}
     )
 
-    mock_execute = AsyncMock()
-    appdb.execute = lambda *args, **kwargs: zigpy.appdb.CursorContext(
-        mock_execute(*args, **kwargs)
-    )
+    mock_execute = AsyncMock(return_value=MagicMock(aclose=AsyncMock()))
+    appdb.execute = mock_execute
 
     # Migrations must explicitly specify all old tables, even if they will be untouched
     with pytest.raises(RuntimeError):

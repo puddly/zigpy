@@ -2725,6 +2725,28 @@ async def test_shutdown_survives_failed_commit(tmp_path, caplog):
     assert await _read_count(db, "endpoints") == 0
 
 
+async def test_shutdown_survives_rolled_back_commit(tmp_path, caplog, monkeypatch):
+    """A commit failure that already rolled back the transaction must not fail shutdown."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_db(db, commit_interval=10.0)
+    listener = app._dblistener
+
+    await _write_uncommitted(listener)
+
+    # Errors like `SQLITE_FULL` can make SQLite roll back the transaction by itself
+    def _commit_rolled_back(db):
+        db.execute("ROLLBACK")
+        raise apsw.FullError("database or disk is full")
+
+    monkeypatch.setattr(zigpy.appdb, "_commit_transaction", _commit_rolled_back)
+
+    await listener.shutdown()
+
+    assert "Failed to commit pending changes during shutdown" in caplog.text
+    assert not listener._db_thread.is_alive()
+    assert await _read_count(db, "groups") == 0
+
+
 async def test_shutdown_closes_database_on_failure(tmp_path):
     """The connection must be closed even if shutdown fails after the commit."""
     db = tmp_path / "test.db"

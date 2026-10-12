@@ -136,6 +136,13 @@ def _commit_transaction(db: apsw.Connection) -> None:
         db.execute("COMMIT")
 
 
+def _rollback_transaction(db: apsw.Connection) -> None:
+    """Roll back the open transaction, if any. Runs in the worker thread, so it's atomic."""
+    # Some failed commits already roll back the transaction
+    if not db.get_autocommit():
+        db.execute("ROLLBACK")
+
+
 def decode_str_attribute(value: str | bytes) -> str:
     if isinstance(value, str):
         return value
@@ -287,7 +294,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 await self._db.async_run(_commit_transaction, self._db)
             except Exception:
                 LOGGER.exception("Failed to commit pending changes during shutdown")
-                await self._db.execute("ROLLBACK")
+                await self._db.async_run(_rollback_transaction, self._db)
 
             # Delete the journal on shutdown
             await self.execute("PRAGMA wal_checkpoint;")
@@ -1313,8 +1320,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             )
 
         if db_version == 0 and not tables:
-            # If this is a brand new database, just load the current schema
-            await self.execute(zigpy.appdb_schemas.SCHEMAS[DB_VERSION])
+            # If this is a brand new database, just load the current schema. Creating it
+            # in a transaction never leaves the schema version set with tables missing.
+            async with self._db:
+                await self.execute(zigpy.appdb_schemas.SCHEMAS[DB_VERSION])
             return False
         elif db_version > DB_VERSION:
             LOGGER.error(

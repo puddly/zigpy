@@ -783,3 +783,25 @@ async def test_data_migration_ambiguous_attributes(tmp_path):
             (str(dev.ieee), 0xFC02, 0x0020),
         ).fetchall()
         assert rows == [(-1,)]
+
+
+async def test_new_database_schema_is_atomic(tmp_path):
+    """A failure while creating a new database's schema must leave it empty."""
+    db_path = tmp_path / "test.db"
+    schema = zigpy.appdb_schemas.SCHEMAS[zigpy.appdb.DB_VERSION]
+
+    # The schema sets `user_version` first, then fails after creating some tables
+    with patch.dict(
+        zigpy.appdb_schemas.SCHEMAS,
+        {zigpy.appdb.DB_VERSION: schema + "\nCREATE TABLE broken (;"},
+    ):
+        with pytest.raises(apsw.SQLError):
+            await make_app_with_db(db_path)
+
+    assert dump_db(db_path) == (0, "BEGIN TRANSACTION;\nCOMMIT;")
+
+    # The database is created normally on the next start
+    app = await make_app_with_db(db_path)
+    await app.shutdown()
+
+    assert dump_db(db_path)[0] == zigpy.appdb.DB_VERSION

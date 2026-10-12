@@ -461,7 +461,9 @@ async def test_migration_missing_tables(app):
     )
 
     mock_execute = AsyncMock(return_value=MagicMock(aclose=AsyncMock()))
-    appdb.execute = mock_execute
+    appdb.execute = lambda *args, **kwargs: zigpy.appdb.CursorResult(
+        mock_execute(*args, **kwargs)
+    )
 
     # Migrations must explicitly specify all old tables, even if they will be untouched
     with pytest.raises(RuntimeError):

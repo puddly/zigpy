@@ -84,6 +84,10 @@ class CorruptDatabase(ZigbeeException):
     """The SQLite database is corrupt or otherwise inconsistent"""
 
 
+class DatabaseWriteCancelled(ZigbeeException):
+    """A database write was cancelled before it completed"""
+
+
 class QuirksException(Exception):
     """Base exception class"""
 

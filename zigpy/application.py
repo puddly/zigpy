@@ -693,12 +693,12 @@ class ControllerApplication(zigpy.util.ListenableMixin, abc.ABC):
                     group.remove_member(ep, suppress_event=True)
 
         # Remove old device data from DB (cascade deletes endpoints, clusters,
-        # attribute cache, group members, and relays).  We call _remove_device
-        # directly instead of the public device_removed() because we need the
-        # delete to complete before _finalize_device enqueues the save.
+        # attribute cache, group members, and relays).  We wait for the delete
+        # instead of using the public device_removed() because it must complete
+        # before _finalize_device schedules the save.
         if self._dblistener is not None:
             old_device.remove_listener(self._dblistener)
-            await self._dblistener._remove_device(old_device)
+            await self._dblistener.remove_device(old_device)
 
         # Clean up old device's callbacks and tasks
         old_device.on_remove()

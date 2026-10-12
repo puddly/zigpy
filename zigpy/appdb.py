@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 import contextlib
 from datetime import UTC, datetime, timedelta
+import functools
 import json
 import logging
 import queue
 import re
 import threading
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, ParamSpec
 
 import apsw
 import apsw.aio
@@ -58,6 +66,8 @@ if tuple(map(int, apsw.sqlite_lib_version().split("."))) < MIN_SQLITE_VERSION:
     )
 
 LOGGER = logging.getLogger(__name__)
+
+P = ParamSpec("P")
 
 DB_VERSION = 15
 DB_V = f"_v{DB_VERSION}"
@@ -172,14 +182,13 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self._db = connection
         self._db_thread = controller.thread
         self._application = application
-        self._callback_handlers: asyncio.Queue = asyncio.Queue()
         self.running = False
-        self._worker_task = asyncio.create_task(self._worker())
+        self._write_tasks: set[asyncio.Task[None]] = set()
 
         self._commit_interval = self._application.config[conf.CONF_DB_COMMIT_INTERVAL]
         self._commit_task: asyncio.Task | None = None
 
-        # Serializes writes and commits, `_remove_device` is also called directly
+        # Runs writes one at a time, in the order they were scheduled
         self._write_lock = asyncio.Lock()
 
     async def initialize_tables(self) -> None:
@@ -232,37 +241,80 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         listener.running = True
         return listener
 
-    async def _worker(self) -> None:
-        """Process request in the received order."""
-        while True:
-            cb_name, args = await self._callback_handlers.get()
-            handler = getattr(self, cb_name)
-            assert handler
-            try:
-                await handler(*args)
-            except apsw.Error as exc:
-                LOGGER.debug(
-                    "Error handling '%s' event with %s params: %s",
-                    cb_name,
-                    args,
-                    str(exc),
-                    exc_info=True,
-                )
-            except Exception:  # noqa: BLE001
-                LOGGER.exception(
-                    "Unexpected error while processing %s(%s)", cb_name, args
-                )
-            self._callback_handlers.task_done()
+    def _schedule(
+        self,
+        func: Callable[P, Coroutine[Any, Any, None]],
+        /,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> asyncio.Task[None] | None:
+        """Schedule a write to run after all writes scheduled before it."""
+        if not self.running:
+            LOGGER.debug("Discarding %s%s", func.__name__, args)
+            return None
+
+        task = asyncio.create_task(self._run_write(func, *args, **kwargs))
+        self._write_tasks.add(task)
+        task.add_done_callback(functools.partial(self._write_done, func, args))
+
+        return task
+
+    async def _run_write(
+        self,
+        func: Callable[P, Coroutine[Any, Any, None]],
+        /,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> None:
+        # Acquiring the lock before any other `await` keeps writes in order
+        try:
+            async with self._write_lock:
+                await func(*args, **kwargs)
+        except asyncio.CancelledError as exc:
+            # A `CancelledError` would escape into the scope of whoever awaits this
+            raise zigpy.exceptions.DatabaseWriteCancelled(
+                f"Database write {func.__name__}{args} was cancelled"
+            ) from exc
+
+    def _write_done(
+        self,
+        func: Callable[..., Coroutine[Any, Any, None]],
+        args: tuple[Any, ...],
+        task: asyncio.Task[None],
+    ) -> None:
+        self._write_tasks.remove(task)
+
+        # Only possible if the task is cancelled before it starts running
+        if task.cancelled():
+            LOGGER.warning("Database write %s%s was cancelled", func.__name__, args)
+            return
+
+        exc = task.exception()
+
+        if isinstance(exc, apsw.Error):
+            LOGGER.debug(
+                "Error handling '%s' event with %s params: %s",
+                func.__name__,
+                args,
+                str(exc),
+                exc_info=exc,
+            )
+        elif exc is not None:
+            LOGGER.error(
+                "Unexpected error while processing %s(%s)",
+                func.__name__,
+                args,
+                exc_info=exc,
+            )
 
     async def _commit(self, force: bool = False) -> None:
         """Commit changes to the database, optionally deferring the operation.
 
-        Commits wait for the write lock, so they never persist a partial write.
+        A deferred commit is a scheduled write, so it never persists a partial write.
         """
         if force or self._commit_interval <= 0:
             try:
-                async with self._write_lock:
-                    await self._db.async_run(_commit_transaction, self._db)
+                await self._db.async_run(_commit_transaction, self._db)
             except Exception:
                 # Retry the uncommitted writes after another interval
                 if self._commit_interval > 0:
@@ -279,15 +331,14 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             self._commit_task = asyncio.create_task(self._delayed_commit())
 
     async def _delayed_commit(self) -> None:
-        """Wait out the commit interval, then queue a flush on the worker."""
+        """Wait out the commit interval, then schedule a flush."""
         await asyncio.sleep(self._commit_interval)
-        self.enqueue("_flush_commit")
+        self._schedule(self._flush_commit)
 
     async def _flush_commit(self) -> None:
-        """Commit any open transaction, invoked by the worker after the delay."""
+        """Commit any open transaction, scheduled after the delay."""
         try:
-            async with self._write_lock:
-                await self._db.async_run(_commit_transaction, self._db)
+            await self._db.async_run(_commit_transaction, self._db)
         except Exception:
             LOGGER.exception("Failed to flush pending database commits")
             self._arm_commit_timer()
@@ -295,21 +346,21 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def shutdown(self) -> None:
         """Shutdown connection."""
         self.running = False
-        await self._callback_handlers.join()
-        if not self._worker_task.done():
-            self._worker_task.cancel()
+
+        # Waiting does not cancel the writes if shutdown itself is cancelled
+        if self._write_tasks:
+            await asyncio.wait(self._write_tasks)
 
         if self._commit_task is not None:
             self._commit_task.cancel()
             self._commit_task = None
 
         try:
-            async with self._write_lock:
-                try:
-                    await self._db.async_run(_commit_transaction, self._db)
-                except Exception:
-                    LOGGER.exception("Failed to commit pending changes during shutdown")
-                    await self._db.async_run(_rollback_transaction, self._db)
+            try:
+                await self._db.async_run(_commit_transaction, self._db)
+            except Exception:
+                LOGGER.exception("Failed to commit pending changes during shutdown")
+                await self._db.async_run(_rollback_transaction, self._db)
 
             # Delete the journal on shutdown
             await self.execute("PRAGMA wal_checkpoint;")
@@ -335,27 +386,21 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             self.on_ota_query_cache_cleared,
         )
 
-    def enqueue(self, cb_name: str, *args) -> None:
-        """Enqueue an async callback handler action."""
-        if not self.running:
-            LOGGER.debug("Discarding %s event", cb_name)
-            return
-        self._callback_handlers.put_nowait((cb_name, args))
-
     @contextlib.asynccontextmanager
     async def _write(self, *, force_commit: bool = False) -> AsyncIterator[None]:
         """Write in a savepoint, so a failure partway through leaves no writes."""
-        async with self._write_lock:
-            await self._db.async_run(_begin_savepoint, self._db)
+        # Only scheduled writes hold the lock, so this never interleaves with another
+        assert self._write_lock.locked()
 
-            try:
-                yield
-            except BaseException:
-                await self._db.async_run(_rollback_savepoint, self._db)
-                raise
+        await self._db.async_run(_begin_savepoint, self._db)
 
-            await self._db.execute("RELEASE write")
+        try:
+            yield
+        except BaseException:
+            await self._db.async_run(_rollback_savepoint, self._db)
+            raise
 
+        await self._db.execute("RELEASE write")
         await self._commit(force=force_commit)
 
     # Bindings are `Any`: `_convert_binding` handles types apsw doesn't know about
@@ -379,7 +424,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             yield cursor
 
     def device_joined(self, device: Device) -> None:
-        self.enqueue("_update_device_nwk", device.ieee, device.nwk)
+        self._schedule(self._update_device_nwk, device.ieee, device.nwk)
 
     async def _update_device_nwk(self, ieee: t.EUI64, nwk: t.NWK) -> None:
         async with self._write(force_commit=True):
@@ -395,7 +440,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def device_last_seen_updated(self, device: Device, last_seen: datetime) -> None:
         """Device last_seen time is updated."""
-        self.enqueue("_save_device_last_seen", device.ieee, last_seen)
+        self._schedule(self._save_device_last_seen, device.ieee, last_seen)
 
     async def _save_device_last_seen(self, ieee: t.EUI64, last_seen: datetime) -> None:
         async with self._write():
@@ -413,7 +458,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def device_relays_updated(self, device: Device, relays: t.Relays | None) -> None:
         """Device relay list is updated."""
-        self.enqueue("_save_device_relays", device.ieee, relays)
+        self._schedule(self._save_device_relays, device.ieee, relays)
 
     async def _save_device_relays(self, ieee: t.EUI64, relays: t.Relays | None) -> None:
         async with self._write():
@@ -427,7 +472,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def neighbors_updated(self, ieee: t.EUI64, neighbors: list[zdo_t.Neighbor]) -> None:
         """Neighbor update from Mgmt_Lqi_req."""
-        self.enqueue("_neighbors_updated", ieee, neighbors)
+        self._schedule(self._neighbors_updated, ieee, neighbors)
 
     async def _neighbors_updated(
         self, ieee: t.EUI64, neighbors: list[zdo_t.Neighbor]
@@ -445,7 +490,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def routes_updated(self, ieee: t.EUI64, routes: list[zdo_t.Route]) -> None:
         """Route update from Mgmt_Rtg_req."""
-        self.enqueue("_routes_updated", ieee, routes)
+        self._schedule(self._routes_updated, ieee, routes)
 
     async def _routes_updated(self, ieee: t.EUI64, routes: list[zdo_t.Route]) -> None:
         async with self._write():
@@ -461,7 +506,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def group_added(self, group: zigpy.group.Group) -> None:
         """Group is added."""
-        self.enqueue("_group_added", group)
+        self._schedule(self._group_added, group)
 
     async def _group_added(self, group: zigpy.group.Group) -> None:
         async with self._write(force_commit=True):
@@ -472,7 +517,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def group_member_added(self, group: zigpy.group.Group, ep: Endpoint) -> None:
         """Called when a group member is added."""
-        self.enqueue("_group_member_added", group, ep)
+        self._schedule(self._group_member_added, group, ep)
 
     async def _group_member_added(self, group: zigpy.group.Group, ep: Endpoint) -> None:
         async with self._write(force_commit=True):
@@ -483,7 +528,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def group_member_removed(self, group: zigpy.group.Group, ep: Endpoint) -> None:
         """Called when a group member is removed."""
-        self.enqueue("_group_member_removed", group, ep)
+        self._schedule(self._group_member_removed, group, ep)
 
     async def _group_member_removed(
         self, group: zigpy.group.Group, ep: Endpoint
@@ -496,7 +541,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     def group_removed(self, group: zigpy.group.Group) -> None:
         """Called when a group is removed."""
-        self.enqueue("_group_removed", group)
+        self._schedule(self._group_removed, group)
 
     async def _group_removed(self, group: zigpy.group.Group) -> None:
         async with self._write(force_commit=True):
@@ -504,7 +549,15 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             await self.execute(q, (group.group_id,))
 
     def device_removed(self, device: Device) -> None:
-        self.enqueue("_remove_device", device)
+        self._schedule(self._remove_device, device)
+
+    async def remove_device(self, device: Device) -> None:
+        """Remove a device, in order with other writes, and wait for it to complete."""
+        task = self._schedule(self._remove_device, device)
+
+        # The write completes even if the caller is cancelled
+        if task is not None:
+            await asyncio.shield(task)
 
     async def _remove_device(self, device: Device) -> None:
         async with self._write(force_commit=True):
@@ -515,7 +568,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     def raw_device_initialized(self, device: Device) -> None:
         # We work with a clone of a device so that quirks that run in the same event
         # loop iteration do not manage to mutate it before the async database code runs
-        self.enqueue("_raw_device_initialized", device.clone())
+        self._schedule(self._raw_device_initialized, device.clone())
 
     async def _raw_device_initialized(self, device: Device) -> None:
         # To ensure events do not leak with the discarded device clone, we need to clean
@@ -697,16 +750,16 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             await self.executemany(q, rows)
 
     def on_attribute_read(self, event: AttributeReadEvent) -> None:
-        self.enqueue("_save_attribute", event)
+        self._schedule(self._save_attribute, event)
 
     def on_attribute_reported(self, event: AttributeReportedEvent) -> None:
-        self.enqueue("_save_attribute", event)
+        self._schedule(self._save_attribute, event)
 
     def on_attribute_updated(self, event: AttributeUpdatedEvent) -> None:
-        self.enqueue("_save_attribute", event)
+        self._schedule(self._save_attribute, event)
 
     def on_attribute_written(self, event: AttributeWrittenEvent) -> None:
-        self.enqueue("_save_attribute", event)
+        self._schedule(self._save_attribute, event)
 
     async def _save_attribute(
         self,
@@ -746,7 +799,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             )
 
     def on_attribute_cleared(self, event: AttributeClearedEvent) -> None:
-        self.enqueue("_clear_attribute", event)
+        self._schedule(self._clear_attribute, event)
 
     async def _clear_attribute(self, event: AttributeClearedEvent) -> None:
         async with self._write():
@@ -774,7 +827,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             )
 
     def on_attribute_unsupported(self, event: AttributeUnsupportedEvent) -> None:
-        self.enqueue("_unsupported_attribute_added", event)
+        self._schedule(self._unsupported_attribute_added, event)
 
     async def _unsupported_attribute_added(
         self, event: AttributeUnsupportedEvent
@@ -801,7 +854,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             )
 
     def on_ota_query_cache_updated(self, event: OtaQueryCacheUpdatedEvent) -> None:
-        self.enqueue("_save_ota_query_cache_entry", event)
+        self._schedule(self._save_ota_query_cache_entry, event)
 
     async def _save_ota_query_cache_entry(
         self, event: OtaQueryCacheUpdatedEvent
@@ -832,7 +885,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             )
 
     def on_ota_query_cache_cleared(self, event: OtaQueryCacheClearedEvent) -> None:
-        self.enqueue("_delete_ota_query_cache_entry", event)
+        self._schedule(self._delete_ota_query_cache_entry, event)
 
     async def _delete_ota_query_cache_entry(
         self, event: OtaQueryCacheClearedEvent
@@ -844,7 +897,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             )
 
     def network_backup_created(self, backup: zigpy.backups.NetworkBackup) -> None:
-        self.enqueue("_network_backup_created", json.dumps(backup.as_dict()))
+        self._schedule(self._network_backup_created, json.dumps(backup.as_dict()))
 
     async def _network_backup_created(self, backup_json: str) -> None:
         async with self._write(force_commit=True):
@@ -856,7 +909,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             await self.execute(q, (None, backup_json))
 
     def network_backup_removed(self, backup: zigpy.backups.NetworkBackup) -> None:
-        self.enqueue("_network_backup_removed", backup.backup_time)
+        self._schedule(self._network_backup_removed, backup.backup_time)
 
     async def _network_backup_removed(self, backup_time: datetime) -> None:
         async with self._write(force_commit=True):

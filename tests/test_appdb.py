@@ -35,6 +35,7 @@ from zigpy.const import (
 )
 from zigpy.device import Device, GreenPowerDevice, Status
 import zigpy.endpoint
+import zigpy.exceptions
 import zigpy.group
 import zigpy.ota
 import zigpy.types as t
@@ -2216,6 +2217,31 @@ async def _wait_for_attr_value(db, expected, attr_id=0, message=None):
     )
 
 
+async def _wait_for_writes(listener):
+    """Wait until all scheduled writes, including ones they schedule, are done."""
+    while listener._write_tasks:
+        await asyncio.wait(listener._write_tasks)
+
+
+async def _block_writes(listener):
+    """Schedule a write that holds up later writes until the returned event is set."""
+    writing = asyncio.Event()
+    may_finish = asyncio.Event()
+
+    async def _blocked_write():
+        async with listener._write():
+            await listener.execute(
+                f"INSERT INTO groups{zigpy.appdb.DB_V} VALUES (?, ?)", (1, "test")
+            )
+            writing.set()
+            await may_finish.wait()
+
+    listener._schedule(_blocked_write)
+    await asyncio.wait_for(writing.wait(), timeout=5.0)
+
+    return may_finish
+
+
 async def _write_uncommitted(listener, group_id=1):
     """Write a row without committing it, leaving a transaction open."""
     await listener.execute("BEGIN")
@@ -2261,7 +2287,7 @@ async def test_database_commit_interval(tmp_path):
     # the delayed-commit timer. A bare `sleep(0)` is not enough: the handler's
     # SQL runs on apsw's connection thread, which the loop cannot wait for,
     # so the assertions below would pass vacuously against an empty table.
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
     assert await listener._db.in_transaction
     assert listener._commit_task is not None
 
@@ -2286,7 +2312,7 @@ async def test_database_commit_interval_shutdown_forces_commit(tmp_path):
     clus.update_attribute(0, 99)
 
     # Wait for `_save_attribute` to run and arm the 10s timer.
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
     assert await listener._db.in_transaction
 
     # Verify it has not yet committed
@@ -2328,20 +2354,19 @@ async def test_commit_does_not_land_mid_handler(tmp_path, monkeypatch):
         handler_first_statement_done.set()
 
         # Block until the test releases us, well past the commit interval. The timer
-        # fires during this wait and enqueues `_flush_commit`, which cannot run
-        # because we're still holding the worker. Waiting on an event rather than
+        # fires during this wait and schedules `_flush_commit`, which cannot run
+        # because we're still holding the write lock. Waiting on an event rather than
         # sleeping keeps the assertions below independent of wall-clock scheduling.
         await handler_may_finish.wait()
         handler_finished.set()
 
-    listener._synthetic_two_statement_handler = _synthetic_two_statement_handler
-    listener.enqueue("_synthetic_two_statement_handler")
+    listener._schedule(_synthetic_two_statement_handler)
 
     # Wait for the handler to reach its first statement and arm the timer.
     await asyncio.wait_for(handler_first_statement_done.wait(), timeout=5.0)
 
-    # Wait long enough that the 0.05s timer has fired (it enqueues `_flush_commit`,
-    # which is still queued behind the handler).
+    # Wait long enough that the 0.05s timer has fired (it schedules `_flush_commit`,
+    # which waits behind the handler).
     await asyncio.sleep(0.10)
     assert not handler_finished.is_set(), (
         "handler should still be blocked — worker is busy running it"
@@ -2356,15 +2381,12 @@ async def test_commit_does_not_land_mid_handler(tmp_path, monkeypatch):
     # `_flush_commit` has run and committed.
     handler_may_finish.set()
     await asyncio.wait_for(handler_finished.wait(), timeout=5.0)
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
     assert len(commit_calls) == 1, (
         f"expected exactly one commit from `_flush_commit` after the handler "
         f"returned, got {len(commit_calls)}"
     )
-
-    # Clean up the synthetic handler so it doesn't leak.
-    del listener._synthetic_two_statement_handler
 
     await app.shutdown()
 
@@ -2377,11 +2399,11 @@ async def test_failed_handler_is_rolled_back(tmp_path):
     listener = app._dblistener
 
     _, _, clus = _add_joined_device(app)
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
     # A deferred write from another handler is pending
     clus.update_attribute(0, 42)
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
     assert await listener._db.in_transaction
 
     # This device's save fails after its device row is written: SQLite cannot store
@@ -2395,7 +2417,7 @@ async def test_failed_handler_is_rolled_back(tmp_path):
     ep.device_type = profiles.zha.DeviceType.PUMP
     ep.add_input_cluster(0).update_attribute(0, [1, 2])
     app.device_initialized(dev)
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
     await app.shutdown()
 
@@ -2405,47 +2427,82 @@ async def test_failed_handler_is_rolled_back(tmp_path):
 
 
 @patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
-async def test_direct_write_waits_for_handler(tmp_path):
-    """`_remove_device` is called directly and must not commit a partial handler."""
+async def test_remove_device_waits_for_earlier_writes(tmp_path):
+    """`remove_device` runs after earlier writes and never commits a partial one."""
     db = tmp_path / "test.db"
     app = await make_app_with_db(db, commit_interval=10.0)
     listener = app._dblistener
 
     dev, _, _ = _add_joined_device(app)
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
-    handler_writing = asyncio.Event()
-    handler_may_finish = asyncio.Event()
-
-    async def _blocked_handler():
-        async with listener._write():
-            await listener.execute(
-                f"INSERT INTO groups{zigpy.appdb.DB_V} VALUES (?, ?)", (1, "test")
-            )
-            handler_writing.set()
-            await handler_may_finish.wait()
-
-    listener._blocked_handler = _blocked_handler
-    listener.enqueue("_blocked_handler")
-    await asyncio.wait_for(handler_writing.wait(), timeout=5.0)
-
-    remove_task = asyncio.create_task(listener._remove_device(dev))
+    may_finish = await _block_writes(listener)
+    remove_task = asyncio.create_task(listener.remove_device(dev))
     await asyncio.sleep(0.05)
 
-    # The removal waits for the handler and nothing is committed in the meantime
+    # The removal waits for the earlier write and nothing is committed meanwhile
     assert not remove_task.done()
     assert await _read_count(db, "groups") == 0
     assert await _read_count(db, "devices") == 1
 
-    handler_may_finish.set()
+    may_finish.set()
     await asyncio.wait_for(remove_task, timeout=5.0)
 
-    # The forced commit of the removal also commits the completed handler
+    # The forced commit of the removal also commits the earlier write
     assert await _read_count(db, "groups") == 1
     assert await _read_count(db, "devices") == 0
 
-    del listener._blocked_handler
     await app.shutdown()
+
+
+@patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
+async def test_remove_device_survives_cancelled_caller(tmp_path):
+    """Cancelling the caller of `remove_device` does not cancel the write."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_db(db, commit_interval=10.0)
+    listener = app._dblistener
+
+    dev, _, _ = _add_joined_device(app)
+    await _wait_for_writes(listener)
+
+    may_finish = await _block_writes(listener)
+    remove_task = asyncio.create_task(listener.remove_device(dev))
+    await asyncio.sleep(0)
+
+    remove_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await remove_task
+
+    may_finish.set()
+    await _wait_for_writes(listener)
+    assert await _read_count(db, "devices") == 0
+
+    await app.shutdown()
+
+
+@patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
+async def test_cancelled_write_raises_database_write_cancelled(tmp_path):
+    """A cancelled write raises a domain exception, never `CancelledError`."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_db(db, commit_interval=10.0)
+    listener = app._dblistener
+
+    dev, _, _ = _add_joined_device(app)
+    await _wait_for_writes(listener)
+
+    may_finish = await _block_writes(listener)
+    task = listener._schedule(listener._remove_device, dev)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    may_finish.set()
+
+    with pytest.raises(zigpy.exceptions.DatabaseWriteCancelled):
+        await task
+
+    await app.shutdown()
+    assert await _read_count(db, "devices") == 1
 
 
 async def test_write_after_flush_is_committed(tmp_path):
@@ -2459,14 +2516,14 @@ async def test_write_after_flush_is_committed(tmp_path):
     clus.update_attribute(0, 1)
 
     # Wait for the first flush to land by polling for the value.
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
     await _wait_for_attr_value(db, 1, message="first flush did not land")
 
     # Second write after the first flush — arms a new timer.
     clus.update_attribute(0, 2)
 
     # Wait for the worker to run `_save_attribute` and arm the timer.
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
     # The second write must not be committed yet. Assert on the listener's own
     # state rather than on the DB: reading over a fresh connection can take
@@ -2491,10 +2548,10 @@ async def test_force_commit_commits_pending_writes(tmp_path):
 
     # `handle_join` and `device_initialized` each enqueue their own handlers, so
     # wait for the worker to drain all of them before issuing the attribute write
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
     clus.update_attribute(0, 7)
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
     assert await listener._db.in_transaction
     assert await _read_attr_value(db) is None
 
@@ -2559,7 +2616,7 @@ async def test_ota_query_cache_delete_is_deferred_like_save(tmp_path):
     # Wait for the worker to run the delete handler. `join()` is exact (it
     # blocks until the queue is empty), unlike `sleep(0)` which only yields
     # the event loop and cannot wait on apsw's connection thread.
-    await listener._callback_handlers.join()
+    await _wait_for_writes(listener)
 
     # The delete was issued but the commit is deferred — a separate reader
     # should still see the row until the timer fires (10s, well past the test).

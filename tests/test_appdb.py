@@ -2218,7 +2218,7 @@ async def _wait_for_attr_value(db, expected, attr_id=0, message=None):
 
 async def _write_uncommitted(listener, group_id=1):
     """Write a row without committing it, leaving a transaction open."""
-    await listener._begin()
+    await listener.execute("BEGIN")
     await listener.execute(
         f"INSERT INTO groups{zigpy.appdb.DB_V} VALUES (?, ?)", (group_id, "test")
     )
@@ -2366,6 +2366,85 @@ async def test_commit_does_not_land_mid_handler(tmp_path, monkeypatch):
     # Clean up the synthetic handler so it doesn't leak.
     del listener._synthetic_two_statement_handler
 
+    await app.shutdown()
+
+
+@patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
+async def test_failed_handler_is_rolled_back(tmp_path):
+    """A handler that fails partway through leaves no writes, but keeps others'."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_db(db, commit_interval=10.0)
+    listener = app._dblistener
+
+    _, _, clus = _add_joined_device(app)
+    await listener._callback_handlers.join()
+
+    # A deferred write from another handler is pending
+    clus.update_attribute(0, 42)
+    await listener._callback_handlers.join()
+    assert await listener._db.in_transaction
+
+    # This device's save fails after its device row is written: SQLite cannot store
+    # a list in the attribute cache
+    ieee = make_ieee(1)
+    app.handle_join(0x1234, ieee, 0)
+    dev = app.get_device(ieee)
+    ep = dev.add_endpoint(1)
+    ep.status = zigpy.endpoint.Status.ZDO_INIT
+    ep.profile_id = 260
+    ep.device_type = profiles.zha.DeviceType.PUMP
+    ep.add_input_cluster(0).update_attribute(0, [1, 2])
+    app.device_initialized(dev)
+    await listener._callback_handlers.join()
+
+    await app.shutdown()
+
+    assert await _read_attr_value(db) == 42
+    assert await _read_count(db, "devices", "WHERE ieee = ?", (str(ieee),)) == 0
+    assert await _read_count(db, "endpoints", "WHERE ieee = ?", (str(ieee),)) == 0
+
+
+@patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
+async def test_direct_write_waits_for_handler(tmp_path):
+    """`_remove_device` is called directly and must not commit a partial handler."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_db(db, commit_interval=10.0)
+    listener = app._dblistener
+
+    dev, _, _ = _add_joined_device(app)
+    await listener._callback_handlers.join()
+
+    handler_writing = asyncio.Event()
+    handler_may_finish = asyncio.Event()
+
+    async def _blocked_handler():
+        async with listener._write():
+            await listener.execute(
+                f"INSERT INTO groups{zigpy.appdb.DB_V} VALUES (?, ?)", (1, "test")
+            )
+            handler_writing.set()
+            await handler_may_finish.wait()
+
+    listener._blocked_handler = _blocked_handler
+    listener.enqueue("_blocked_handler")
+    await asyncio.wait_for(handler_writing.wait(), timeout=5.0)
+
+    remove_task = asyncio.create_task(listener._remove_device(dev))
+    await asyncio.sleep(0.05)
+
+    # The removal waits for the handler and nothing is committed in the meantime
+    assert not remove_task.done()
+    assert await _read_count(db, "groups") == 0
+    assert await _read_count(db, "devices") == 1
+
+    handler_may_finish.set()
+    await asyncio.wait_for(remove_task, timeout=5.0)
+
+    # The forced commit of the removal also commits the completed handler
+    assert await _read_count(db, "groups") == 1
+    assert await _read_count(db, "devices") == 0
+
+    del listener._blocked_handler
     await app.shutdown()
 
 

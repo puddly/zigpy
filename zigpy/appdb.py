@@ -124,10 +124,20 @@ class DaemonAsyncIO(apsw.aio.AsyncIO):
         self.thread.start()
 
 
-def _begin_transaction(db: apsw.Connection) -> None:
-    """Begin a transaction if none is open. Runs in the worker thread, so it's atomic."""
+def _begin_savepoint(db: apsw.Connection) -> None:
+    """Open a savepoint within a transaction. Runs in the worker thread."""
+    # Releasing a savepoint opened outside of a transaction would commit it
     if db.get_autocommit():
         db.execute("BEGIN")
+
+    db.execute("SAVEPOINT write")
+
+
+def _rollback_savepoint(db: apsw.Connection) -> None:
+    """Undo the writes since the savepoint. Runs in the worker thread."""
+    # Some errors already roll back the whole transaction
+    if not db.get_autocommit():
+        db.execute("ROLLBACK TO write; RELEASE write")
 
 
 def _commit_transaction(db: apsw.Connection) -> None:
@@ -168,6 +178,9 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         self._commit_interval = self._application.config[conf.CONF_DB_COMMIT_INTERVAL]
         self._commit_task: asyncio.Task | None = None
+
+        # Serializes writes and commits, `_remove_device` is also called directly
+        self._write_lock = asyncio.Lock()
 
     async def initialize_tables(self) -> None:
         async with self._query("PRAGMA integrity_check") as cursor:
@@ -244,12 +257,12 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _commit(self, force: bool = False) -> None:
         """Commit changes to the database, optionally deferring the operation.
 
-        A deferred commit runs on the worker, via `_flush_commit`, so it always lands
-        at a handler boundary instead of persisting a partial handler.
+        Commits wait for the write lock, so they never persist a partial write.
         """
         if force or self._commit_interval <= 0:
             try:
-                await self._db.async_run(_commit_transaction, self._db)
+                async with self._write_lock:
+                    await self._db.async_run(_commit_transaction, self._db)
             except Exception:
                 # Retry the uncommitted writes after another interval
                 if self._commit_interval > 0:
@@ -273,7 +286,8 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _flush_commit(self) -> None:
         """Commit any open transaction, invoked by the worker after the delay."""
         try:
-            await self._db.async_run(_commit_transaction, self._db)
+            async with self._write_lock:
+                await self._db.async_run(_commit_transaction, self._db)
         except Exception:
             LOGGER.exception("Failed to flush pending database commits")
             self._arm_commit_timer()
@@ -290,11 +304,12 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             self._commit_task = None
 
         try:
-            try:
-                await self._db.async_run(_commit_transaction, self._db)
-            except Exception:
-                LOGGER.exception("Failed to commit pending changes during shutdown")
-                await self._db.async_run(_rollback_transaction, self._db)
+            async with self._write_lock:
+                try:
+                    await self._db.async_run(_commit_transaction, self._db)
+                except Exception:
+                    LOGGER.exception("Failed to commit pending changes during shutdown")
+                    await self._db.async_run(_rollback_transaction, self._db)
 
             # Delete the journal on shutdown
             await self.execute("PRAGMA wal_checkpoint;")
@@ -327,9 +342,21 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             return
         self._callback_handlers.put_nowait((cb_name, args))
 
-    async def _begin(self) -> None:
-        """Begin a transaction for a handler's writes, unless one is already open."""
-        await self._db.async_run(_begin_transaction, self._db)
+    @contextlib.asynccontextmanager
+    async def _write(self, *, force_commit: bool = False) -> AsyncIterator[None]:
+        """Write in a savepoint, so a failure partway through leaves no writes."""
+        async with self._write_lock:
+            await self._db.async_run(_begin_savepoint, self._db)
+
+            try:
+                yield
+            except BaseException:
+                await self._db.async_run(_rollback_savepoint, self._db)
+                raise
+
+            await self._db.execute("RELEASE write")
+
+        await self._commit(force=force_commit)
 
     # Bindings are `Any`: `_convert_binding` handles types apsw doesn't know about
     async def execute(
@@ -355,9 +382,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_update_device_nwk", device.ieee, device.nwk)
 
     async def _update_device_nwk(self, ieee: t.EUI64, nwk: t.NWK) -> None:
-        await self._begin()
-        await self.execute(f"UPDATE devices{DB_V} SET nwk=? WHERE ieee=?", (nwk, ieee))
-        await self._commit(force=True)
+        async with self._write(force_commit=True):
+            await self.execute(
+                f"UPDATE devices{DB_V} SET nwk=? WHERE ieee=?", (nwk, ieee)
+            )
 
     def device_initialized(self, device: Device) -> None:
         pass
@@ -370,35 +398,32 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self.enqueue("_save_device_last_seen", device.ieee, last_seen)
 
     async def _save_device_last_seen(self, ieee: t.EUI64, last_seen: datetime) -> None:
-        await self._begin()
-        q = f"""UPDATE devices{DB_V}
-                    SET last_seen=:ts
-                    WHERE ieee=:ieee AND :ts - last_seen > :min_update_delta"""
-        await self.execute(
-            q,
-            {
-                "ts": last_seen.timestamp(),
-                "ieee": ieee,
-                "min_update_delta": MIN_UPDATE_DELTA,
-            },
-        )
-        await self._commit()
+        async with self._write():
+            q = f"""UPDATE devices{DB_V}
+                        SET last_seen=:ts
+                        WHERE ieee=:ieee AND :ts - last_seen > :min_update_delta"""
+            await self.execute(
+                q,
+                {
+                    "ts": last_seen.timestamp(),
+                    "ieee": ieee,
+                    "min_update_delta": MIN_UPDATE_DELTA,
+                },
+            )
 
     def device_relays_updated(self, device: Device, relays: t.Relays | None) -> None:
         """Device relay list is updated."""
         self.enqueue("_save_device_relays", device.ieee, relays)
 
     async def _save_device_relays(self, ieee: t.EUI64, relays: t.Relays | None) -> None:
-        await self._begin()
-        if relays is None:
-            await self.execute(f"DELETE FROM relays{DB_V} WHERE ieee = ?", (ieee,))
-        else:
-            q = f"""INSERT INTO relays{DB_V} VALUES (:ieee, :relays)
-                        ON CONFLICT (ieee)
-                        DO UPDATE SET relays=excluded.relays WHERE relays != :relays"""
-            await self.execute(q, {"ieee": ieee, "relays": relays.serialize()})
-
-        await self._commit()
+        async with self._write():
+            if relays is None:
+                await self.execute(f"DELETE FROM relays{DB_V} WHERE ieee = ?", (ieee,))
+            else:
+                q = f"""INSERT INTO relays{DB_V} VALUES (:ieee, :relays)
+                            ON CONFLICT (ieee)
+                            DO UPDATE SET relays=excluded.relays WHERE relays != :relays"""
+                await self.execute(q, {"ieee": ieee, "relays": relays.serialize()})
 
     def neighbors_updated(self, ieee: t.EUI64, neighbors: list[zdo_t.Neighbor]) -> None:
         """Neighbor update from Mgmt_Lqi_req."""
@@ -407,54 +432,54 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _neighbors_updated(
         self, ieee: t.EUI64, neighbors: list[zdo_t.Neighbor]
     ) -> None:
-        await self._begin()
-        await self.execute(f"DELETE FROM neighbors{DB_V} WHERE device_ieee = ?", [ieee])
+        async with self._write():
+            await self.execute(
+                f"DELETE FROM neighbors{DB_V} WHERE device_ieee = ?", [ieee]
+            )
 
-        rows = [(ieee, *neighbor.as_tuple()) for neighbor in neighbors]
+            rows = [(ieee, *neighbor.as_tuple()) for neighbor in neighbors]
 
-        await self.executemany(
-            f"INSERT INTO neighbors{DB_V} VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows
-        )
-        await self._commit()
+            await self.executemany(
+                f"INSERT INTO neighbors{DB_V} VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows
+            )
 
     def routes_updated(self, ieee: t.EUI64, routes: list[zdo_t.Route]) -> None:
         """Route update from Mgmt_Rtg_req."""
         self.enqueue("_routes_updated", ieee, routes)
 
     async def _routes_updated(self, ieee: t.EUI64, routes: list[zdo_t.Route]) -> None:
-        await self._begin()
-        await self.execute(f"DELETE FROM routes{DB_V} WHERE device_ieee = ?", [ieee])
+        async with self._write():
+            await self.execute(
+                f"DELETE FROM routes{DB_V} WHERE device_ieee = ?", [ieee]
+            )
 
-        rows = [(ieee, *route.as_tuple()) for route in routes]
+            rows = [(ieee, *route.as_tuple()) for route in routes]
 
-        await self.executemany(
-            f"INSERT INTO routes{DB_V} VALUES (?,?,?,?,?,?,?,?)", rows
-        )
-        await self._commit()
+            await self.executemany(
+                f"INSERT INTO routes{DB_V} VALUES (?,?,?,?,?,?,?,?)", rows
+            )
 
     def group_added(self, group: zigpy.group.Group) -> None:
         """Group is added."""
         self.enqueue("_group_added", group)
 
     async def _group_added(self, group: zigpy.group.Group) -> None:
-        await self._begin()
-        q = f"""INSERT INTO groups{DB_V} VALUES (?, ?)
-                    ON CONFLICT (group_id)
-                    DO UPDATE SET name=excluded.name"""
-        await self.execute(q, (group.group_id, group.name))
-        await self._commit(force=True)
+        async with self._write(force_commit=True):
+            q = f"""INSERT INTO groups{DB_V} VALUES (?, ?)
+                        ON CONFLICT (group_id)
+                        DO UPDATE SET name=excluded.name"""
+            await self.execute(q, (group.group_id, group.name))
 
     def group_member_added(self, group: zigpy.group.Group, ep: Endpoint) -> None:
         """Called when a group member is added."""
         self.enqueue("_group_member_added", group, ep)
 
     async def _group_member_added(self, group: zigpy.group.Group, ep: Endpoint) -> None:
-        await self._begin()
-        q = f"""INSERT INTO group_members{DB_V} VALUES (?, ?, ?)
-                    ON CONFLICT
-                    DO NOTHING"""
-        await self.execute(q, (group.group_id, *ep.unique_id))
-        await self._commit(force=True)
+        async with self._write(force_commit=True):
+            q = f"""INSERT INTO group_members{DB_V} VALUES (?, ?, ?)
+                        ON CONFLICT
+                        DO NOTHING"""
+            await self.execute(q, (group.group_id, *ep.unique_id))
 
     def group_member_removed(self, group: zigpy.group.Group, ep: Endpoint) -> None:
         """Called when a group member is removed."""
@@ -463,30 +488,29 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _group_member_removed(
         self, group: zigpy.group.Group, ep: Endpoint
     ) -> None:
-        await self._begin()
-        q = f"""DELETE FROM group_members{DB_V} WHERE group_id=?
-                                                AND ieee=?
-                                                AND endpoint_id=?"""
-        await self.execute(q, (group.group_id, *ep.unique_id))
-        await self._commit(force=True)
+        async with self._write(force_commit=True):
+            q = f"""DELETE FROM group_members{DB_V} WHERE group_id=?
+                                                    AND ieee=?
+                                                    AND endpoint_id=?"""
+            await self.execute(q, (group.group_id, *ep.unique_id))
 
     def group_removed(self, group: zigpy.group.Group) -> None:
         """Called when a group is removed."""
         self.enqueue("_group_removed", group)
 
     async def _group_removed(self, group: zigpy.group.Group) -> None:
-        await self._begin()
-        q = f"DELETE FROM groups{DB_V} WHERE group_id=?"
-        await self.execute(q, (group.group_id,))
-        await self._commit(force=True)
+        async with self._write(force_commit=True):
+            q = f"DELETE FROM groups{DB_V} WHERE group_id=?"
+            await self.execute(q, (group.group_id,))
 
     def device_removed(self, device: Device) -> None:
         self.enqueue("_remove_device", device)
 
     async def _remove_device(self, device: Device) -> None:
-        await self._begin()
-        await self.execute(f"DELETE FROM devices{DB_V} WHERE ieee = ?", (device.ieee,))
-        await self._commit(force=True)
+        async with self._write(force_commit=True):
+            await self.execute(
+                f"DELETE FROM devices{DB_V} WHERE ieee = ?", (device.ieee,)
+            )
 
     def raw_device_initialized(self, device: Device) -> None:
         # We work with a clone of a device so that quirks that run in the same event
@@ -507,35 +531,33 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         if device.original_signature is not None:
             raise ValueError("A device with quirks cannot be saved to the database")
 
-        await self._begin()
+        async with self._write(force_commit=True):
+            q = f"""INSERT INTO devices{DB_V} (ieee, nwk, status, last_seen)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (ieee)
+                        DO UPDATE SET
+                            nwk=excluded.nwk,
+                            status=excluded.status,
+                            last_seen=excluded.last_seen"""
+            await self.execute(
+                q,
+                (
+                    device.ieee,
+                    device.nwk,
+                    device.status,
+                    (device._last_seen or UNIX_EPOCH).timestamp(),
+                ),
+            )
 
-        q = f"""INSERT INTO devices{DB_V} (ieee, nwk, status, last_seen)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT (ieee)
-                    DO UPDATE SET
-                        nwk=excluded.nwk,
-                        status=excluded.status,
-                        last_seen=excluded.last_seen"""
-        await self.execute(
-            q,
-            (
-                device.ieee,
-                device.nwk,
-                device.status,
-                (device._last_seen or UNIX_EPOCH).timestamp(),
-            ),
-        )
+            if device.node_desc is not None:
+                await self._save_node_descriptor(device)
 
-        if device.node_desc is not None:
-            await self._save_node_descriptor(device)
-
-        await self._save_endpoints(device)
-        for ep in device.non_zdo_endpoints:
-            await self._save_clusters(ep)
-            await self._save_attribute_cache(ep)
-            await self._save_unsupported_attributes(ep)
-        await self._save_ota_query_cache(device)
-        await self._commit(force=True)
+            await self._save_endpoints(device)
+            for ep in device.non_zdo_endpoints:
+                await self._save_clusters(ep)
+                await self._save_attribute_cache(ep)
+                await self._save_unsupported_attributes(ep)
+            await self._save_ota_query_cache(device)
 
     async def _save_endpoints(self, device: Device) -> None:
         rows = [
@@ -697,62 +719,59 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             LOGGER.debug("Ignoring failed attribute write event: %s", event)
             return
 
-        await self._begin()
-        await self.execute(
-            f"""
-            INSERT INTO attributes_cache{DB_V} (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code, status, value, last_updated)
-            VALUES (:ieee, :endpoint_id, :cluster_type, :cluster_id, :attr_id, :manufacturer_code, :status, :value, :timestamp)
-                ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx) DO UPDATE
-                SET status=excluded.status, value=excluded.value, last_updated=excluded.last_updated
-                WHERE
-                    value != excluded.value
-                    OR status != excluded.status
-                    OR :timestamp - last_updated > :min_update_delta
-            """,
-            {
-                "ieee": event.device_ieee,
-                "endpoint_id": event.endpoint_id,
-                "cluster_type": event.cluster_type,
-                "cluster_id": event.cluster_id,
-                "attr_id": event.attribute_id,
-                "manufacturer_code": event.manufacturer_code,
-                "status": Status.SUCCESS,
-                "value": event.value,
-                "timestamp": datetime.now(UTC).timestamp(),
-                "min_update_delta": MIN_UPDATE_DELTA,
-            },
-        )
-
-        await self._commit()
+        async with self._write():
+            await self.execute(
+                f"""
+                INSERT INTO attributes_cache{DB_V} (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code, status, value, last_updated)
+                VALUES (:ieee, :endpoint_id, :cluster_type, :cluster_id, :attr_id, :manufacturer_code, :status, :value, :timestamp)
+                    ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx) DO UPDATE
+                    SET status=excluded.status, value=excluded.value, last_updated=excluded.last_updated
+                    WHERE
+                        value != excluded.value
+                        OR status != excluded.status
+                        OR :timestamp - last_updated > :min_update_delta
+                """,
+                {
+                    "ieee": event.device_ieee,
+                    "endpoint_id": event.endpoint_id,
+                    "cluster_type": event.cluster_type,
+                    "cluster_id": event.cluster_id,
+                    "attr_id": event.attribute_id,
+                    "manufacturer_code": event.manufacturer_code,
+                    "status": Status.SUCCESS,
+                    "value": event.value,
+                    "timestamp": datetime.now(UTC).timestamp(),
+                    "min_update_delta": MIN_UPDATE_DELTA,
+                },
+            )
 
     def on_attribute_cleared(self, event: AttributeClearedEvent) -> None:
         self.enqueue("_clear_attribute", event)
 
     async def _clear_attribute(self, event: AttributeClearedEvent) -> None:
-        await self._begin()
-        q = f"""
-            DELETE FROM attributes_cache{DB_V}
-            WHERE
-                ieee = :ieee
-                AND endpoint_id = :endpoint_id
-                AND cluster_type = :cluster_type
-                AND cluster_id = :cluster_id
-                AND attr_id = :attr_id
-                AND manufacturer_code IS NOT DISTINCT FROM :manufacturer_code
-            """
+        async with self._write():
+            q = f"""
+                DELETE FROM attributes_cache{DB_V}
+                WHERE
+                    ieee = :ieee
+                    AND endpoint_id = :endpoint_id
+                    AND cluster_type = :cluster_type
+                    AND cluster_id = :cluster_id
+                    AND attr_id = :attr_id
+                    AND manufacturer_code IS NOT DISTINCT FROM :manufacturer_code
+                """
 
-        await self.execute(
-            q,
-            {
-                "ieee": event.device_ieee,
-                "endpoint_id": event.endpoint_id,
-                "cluster_type": event.cluster_type,
-                "cluster_id": event.cluster_id,
-                "attr_id": event.attribute_id,
-                "manufacturer_code": event.manufacturer_code,
-            },
-        )
-        await self._commit()
+            await self.execute(
+                q,
+                {
+                    "ieee": event.device_ieee,
+                    "endpoint_id": event.endpoint_id,
+                    "cluster_type": event.cluster_type,
+                    "cluster_id": event.cluster_id,
+                    "attr_id": event.attribute_id,
+                    "manufacturer_code": event.manufacturer_code,
+                },
+            )
 
     def on_attribute_unsupported(self, event: AttributeUnsupportedEvent) -> None:
         self.enqueue("_unsupported_attribute_added", event)
@@ -760,27 +779,26 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _unsupported_attribute_added(
         self, event: AttributeUnsupportedEvent
     ) -> None:
-        await self._begin()
-        q = f"""INSERT INTO attributes_cache{DB_V} (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code, status, value, last_updated)
-                   VALUES (:ieee, :endpoint_id, :cluster_type, :cluster_id, :attr_id, :manufacturer_code, :status, :value, :timestamp)
-                   ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx)
-                   DO UPDATE SET status=excluded.status, value=excluded.value, last_updated=excluded.last_updated"""
+        async with self._write():
+            q = f"""INSERT INTO attributes_cache{DB_V} (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code, status, value, last_updated)
+                       VALUES (:ieee, :endpoint_id, :cluster_type, :cluster_id, :attr_id, :manufacturer_code, :status, :value, :timestamp)
+                       ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx)
+                       DO UPDATE SET status=excluded.status, value=excluded.value, last_updated=excluded.last_updated"""
 
-        await self.execute(
-            q,
-            {
-                "ieee": event.device_ieee,
-                "endpoint_id": event.endpoint_id,
-                "cluster_type": event.cluster_type,
-                "cluster_id": event.cluster_id,
-                "attr_id": event.attribute_id,
-                "manufacturer_code": event.manufacturer_code,
-                "status": Status.UNSUPPORTED_ATTRIBUTE,
-                "value": None,
-                "timestamp": datetime.now(UTC).timestamp(),
-            },
-        )
-        await self._commit()
+            await self.execute(
+                q,
+                {
+                    "ieee": event.device_ieee,
+                    "endpoint_id": event.endpoint_id,
+                    "cluster_type": event.cluster_type,
+                    "cluster_id": event.cluster_id,
+                    "attr_id": event.attribute_id,
+                    "manufacturer_code": event.manufacturer_code,
+                    "status": Status.UNSUPPORTED_ATTRIBUTE,
+                    "value": None,
+                    "timestamp": datetime.now(UTC).timestamp(),
+                },
+            )
 
     def on_ota_query_cache_updated(self, event: OtaQueryCacheUpdatedEvent) -> None:
         self.enqueue("_save_ota_query_cache_entry", event)
@@ -788,31 +806,30 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _save_ota_query_cache_entry(
         self, event: OtaQueryCacheUpdatedEvent
     ) -> None:
-        await self._begin()
-        q = f"""INSERT INTO ota_query_cache{DB_V}
-                    (ieee, endpoint_id, manufacturer_code, image_type,
-                     current_file_version, hardware_version, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (ieee, endpoint_id) DO UPDATE SET
-                    manufacturer_code=excluded.manufacturer_code,
-                    image_type=excluded.image_type,
-                    current_file_version=excluded.current_file_version,
-                    hardware_version=excluded.hardware_version,
-                    last_updated=excluded.last_updated"""
+        async with self._write():
+            q = f"""INSERT INTO ota_query_cache{DB_V}
+                        (ieee, endpoint_id, manufacturer_code, image_type,
+                         current_file_version, hardware_version, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ieee, endpoint_id) DO UPDATE SET
+                        manufacturer_code=excluded.manufacturer_code,
+                        image_type=excluded.image_type,
+                        current_file_version=excluded.current_file_version,
+                        hardware_version=excluded.hardware_version,
+                        last_updated=excluded.last_updated"""
 
-        await self.execute(
-            q,
-            (
-                event.device_ieee,
-                event.endpoint_id,
-                event.manufacturer_code,
-                event.image_type,
-                event.current_file_version,
-                event.hardware_version,
-                datetime.now(UTC).timestamp(),
-            ),
-        )
-        await self._commit()
+            await self.execute(
+                q,
+                (
+                    event.device_ieee,
+                    event.endpoint_id,
+                    event.manufacturer_code,
+                    event.image_type,
+                    event.current_file_version,
+                    event.hardware_version,
+                    datetime.now(UTC).timestamp(),
+                ),
+            )
 
     def on_ota_query_cache_cleared(self, event: OtaQueryCacheClearedEvent) -> None:
         self.enqueue("_delete_ota_query_cache_entry", event)
@@ -820,36 +837,33 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _delete_ota_query_cache_entry(
         self, event: OtaQueryCacheClearedEvent
     ) -> None:
-        await self._begin()
-        await self.execute(
-            f"DELETE FROM ota_query_cache{DB_V} WHERE ieee = ? AND endpoint_id = ?",
-            (event.device_ieee, event.endpoint_id),
-        )
-        await self._commit()
+        async with self._write():
+            await self.execute(
+                f"DELETE FROM ota_query_cache{DB_V} WHERE ieee = ? AND endpoint_id = ?",
+                (event.device_ieee, event.endpoint_id),
+            )
 
     def network_backup_created(self, backup: zigpy.backups.NetworkBackup) -> None:
         self.enqueue("_network_backup_created", json.dumps(backup.as_dict()))
 
     async def _network_backup_created(self, backup_json: str) -> None:
-        await self._begin()
-        q = f"""INSERT INTO network_backups{DB_V} VALUES (?, ?)
-                    ON CONFLICT (id)
-                    DO UPDATE SET
-                        backup_json=excluded.backup_json"""
+        async with self._write(force_commit=True):
+            q = f"""INSERT INTO network_backups{DB_V} VALUES (?, ?)
+                        ON CONFLICT (id)
+                        DO UPDATE SET
+                            backup_json=excluded.backup_json"""
 
-        await self.execute(q, (None, backup_json))
-        await self._commit(force=True)
+            await self.execute(q, (None, backup_json))
 
     def network_backup_removed(self, backup: zigpy.backups.NetworkBackup) -> None:
         self.enqueue("_network_backup_removed", backup.backup_time)
 
     async def _network_backup_removed(self, backup_time: datetime) -> None:
-        await self._begin()
-        q = f"""DELETE FROM network_backups{DB_V}
-                    WHERE json_extract(backup_json, '$.backup_time')=?"""
+        async with self._write(force_commit=True):
+            q = f"""DELETE FROM network_backups{DB_V}
+                        WHERE json_extract(backup_json, '$.backup_time')=?"""
 
-        await self.execute(q, (backup_time.isoformat(),))
-        await self._commit(force=True)
+            await self.execute(q, (backup_time.isoformat(),))
 
     async def _read_all_attributes(
         self,

@@ -3,6 +3,7 @@ import contextlib
 from datetime import UTC, datetime, timedelta
 import pathlib
 import sqlite3
+import sys
 import time
 
 import apsw
@@ -2481,8 +2482,20 @@ async def test_remove_device_survives_cancelled_caller(tmp_path):
     await app.shutdown()
 
 
+@pytest.mark.parametrize(
+    "started",
+    [
+        True,
+        pytest.param(
+            False,
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 14), reason="Requires `eager_start`"
+            ),
+        ),
+    ],
+)
 @patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
-async def test_cancelled_write_raises_database_write_cancelled(tmp_path):
+async def test_cancelled_write_raises_database_write_cancelled(tmp_path, started):
     """A cancelled write raises a domain exception, never `CancelledError`."""
     db = tmp_path / "test.db"
     app = await make_app_with_db(db, commit_interval=10.0)
@@ -2493,7 +2506,10 @@ async def test_cancelled_write_raises_database_write_cancelled(tmp_path):
 
     may_finish = await _block_writes(listener)
     task = listener._schedule(listener._remove_device, dev)
-    await asyncio.sleep(0)
+
+    # Without yielding to the event loop, a non-eager task would not have started
+    if started:
+        await asyncio.sleep(0)
 
     task.cancel()
     may_finish.set()

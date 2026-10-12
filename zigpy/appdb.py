@@ -16,6 +16,7 @@ import json
 import logging
 import queue
 import re
+import sys
 import threading
 from typing import TYPE_CHECKING, Any, NamedTuple, ParamSpec
 
@@ -253,7 +254,13 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             LOGGER.debug("Discarding %s%s", func.__name__, args)
             return None
 
-        task = asyncio.create_task(self._run_write(func, *args, **kwargs))
+        coro = self._run_write(func, *args, **kwargs)
+
+        if sys.version_info >= (3, 14):
+            task = asyncio.create_task(coro, eager_start=True)  # type: ignore[call-arg]
+        else:
+            task = asyncio.create_task(coro)
+
         self._write_tasks.add(task)
         task.add_done_callback(functools.partial(self._write_done, func, args))
 
@@ -284,7 +291,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     ) -> None:
         self._write_tasks.remove(task)
 
-        # Only possible if the task is cancelled before it starts running
+        # Only possible before Python 3.14, if the task is cancelled before it starts
         if task.cancelled():
             LOGGER.warning("Database write %s%s was cancelled", func.__name__, args)
             return

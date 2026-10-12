@@ -1,10 +1,11 @@
 import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
 import pathlib
 import sqlite3
 import time
 
-import aiosqlite
+import apsw
 import freezegun
 import pytest
 
@@ -47,8 +48,6 @@ from zigpy.zcl.clusters.general import Basic, Identify, OnOff, Ota
 from zigpy.zcl.foundation import Status as ZCLStatus, ZCLAttributeDef
 from zigpy.zdo import types as zdo_t
 from zigpy.zgp.types import ApplicationID, SrcID
-
-pytestmark = pytest.mark.usefixtures("auto_kill_aiosqlite")
 
 
 async def make_app_with_db(database_file, device_resolver=None, commit_interval=None):
@@ -1790,20 +1789,20 @@ async def test_attribute_cache_null_manufacturer_code_uniqueness(tmp_path):
     await app.shutdown()
 
     # Verify there is only one row in the database
-    async with aiosqlite.connect(db) as conn:
-        cursor = await conn.execute(
+    with contextlib.closing(apsw.Connection(str(db))) as conn:
+        cursor = conn.execute(
             f"SELECT COUNT(*) FROM attributes_cache{zigpy.appdb.DB_V} WHERE attr_id = :attr_id AND manufacturer_code IS NULL",
             {"attr_id": Basic.AttributeDefs.model.id},
         )
-        row = await cursor.fetchone()
+        row = cursor.fetchone()
         assert row[0] == 1
 
         # And the value is the latest one
-        cursor = await conn.execute(
+        cursor = conn.execute(
             f"SELECT value FROM attributes_cache{zigpy.appdb.DB_V} WHERE attr_id = :attr_id AND manufacturer_code IS NULL",
             {"attr_id": Basic.AttributeDefs.model.id},
         )
-        row = await cursor.fetchone()
+        row = cursor.fetchone()
         assert row[0] == "Model 2"
 
 
@@ -2163,22 +2162,22 @@ def _add_joined_device(app):
 
 async def _read_attr_value(db, attr_id=0):
     """Open a separate connection and read the current committed value."""
-    async with aiosqlite.connect(db) as conn:
-        cursor = await conn.execute(
+    with contextlib.closing(apsw.Connection(str(db))) as conn:
+        cursor = conn.execute(
             f"SELECT value FROM attributes_cache{zigpy.appdb.DB_V} WHERE attr_id = ?",
             (attr_id,),
         )
-        row = await cursor.fetchone()
+        row = cursor.fetchone()
         return None if row is None else row[0]
 
 
 async def _read_count(db, table, where="", params=()):
     """Open a separate connection and count committed rows in `table`."""
-    async with aiosqlite.connect(db) as conn:
-        cursor = await conn.execute(
+    with contextlib.closing(apsw.Connection(str(db))) as conn:
+        cursor = conn.execute(
             f"SELECT COUNT(*) FROM {table}{zigpy.appdb.DB_V} {where}", params
         )
-        row = await cursor.fetchone()
+        row = cursor.fetchone()
         return row[0]
 
 
@@ -2222,7 +2221,7 @@ async def _write_uncommitted(listener, group_id=1):
     await listener.execute(
         f"INSERT INTO groups{zigpy.appdb.DB_V} VALUES (?, ?)", (group_id, "test")
     )
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
 
 
 @patch("zigpy.device.Device.schedule_initialize", new=mock_dev_init(True))
@@ -2239,10 +2238,10 @@ async def test_database_commit_interval(tmp_path):
 
     # Wait for the worker to actually run `_save_attribute`, which is what arms
     # the delayed-commit timer. A bare `sleep(0)` is not enough: the handler's
-    # SQL runs on aiosqlite's connection thread, which the loop cannot wait for,
+    # SQL runs on apsw's connection thread, which the loop cannot wait for,
     # so the assertions below would pass vacuously against an empty table.
     await listener._callback_handlers.join()
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
     assert listener._commit_task is not None
 
     # The timer has not fired, so a separate reader must not see the update.
@@ -2267,7 +2266,7 @@ async def test_database_commit_interval_shutdown_forces_commit(tmp_path):
 
     # Wait for `_save_attribute` to run and arm the 10s timer.
     await listener._callback_handlers.join()
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
 
     # Verify it has not yet committed
     assert await _read_attr_value(db) is None
@@ -2373,7 +2372,7 @@ async def test_write_after_flush_is_committed(tmp_path):
     # state rather than on the DB: reading over a fresh connection can take
     # longer than the 0.05s interval on a loaded runner, which would make a DB
     # assertion here a race against the timer rather than a real check.
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
     assert listener._commit_task is not None
 
     # Wait for the second flush by polling for the value.
@@ -2396,19 +2395,19 @@ async def test_force_commit_commits_pending_writes(tmp_path):
 
     clus.update_attribute(0, 7)
     await listener._callback_handlers.join()
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
     assert await _read_attr_value(db) is None
 
     # A force commit (e.g. from a network backup) commits the deferred write too
     await listener._commit(force=True)
-    assert not listener._db.in_transaction
+    assert not await listener._db.in_transaction
     assert await _read_attr_value(db) == 7
 
     # The timer is not cancelled, and finds nothing left to flush
     assert listener._commit_task is not None
     assert not listener._commit_task.done()
     await listener._flush_commit()
-    assert not listener._db.in_transaction
+    assert not await listener._db.in_transaction
 
     await app.shutdown()
 
@@ -2459,7 +2458,7 @@ async def test_ota_query_cache_delete_is_deferred_like_save(tmp_path):
     listener.on_ota_query_cache_cleared(event)
     # Wait for the worker to run the delete handler. `join()` is exact (it
     # blocks until the queue is empty), unlike `sleep(0)` which only yields
-    # the event loop and cannot wait on aiosqlite's connection thread.
+    # the event loop and cannot wait on apsw's connection thread.
     await listener._callback_handlers.join()
 
     # The delete was issued but the commit is deferred — a separate reader
@@ -2620,7 +2619,7 @@ async def test_flush_commit_noop_when_nothing_pending(tmp_path):
     listener = app._dblistener
 
     # With nothing pending, `_flush_commit` should return without committing
-    assert not listener._db.in_transaction
+    assert not await listener._db.in_transaction
     listener._db.commit = AsyncMock(wraps=listener._db.commit)
     await listener._flush_commit()
     listener._db.commit.assert_not_awaited()
@@ -2642,7 +2641,7 @@ async def test_flush_commit_rearms_timer_on_failure(tmp_path):
 
     # The writes are still pending and a new timer is armed to retry them,
     # rather than waiting for the next write or for shutdown.
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
     assert listener._commit_task is not None
     assert not listener._commit_task.done()
 
@@ -2667,7 +2666,7 @@ async def test_force_commit_rearms_timer_on_failure(tmp_path):
 
     # The pending writes get a timer instead of waiting for the next write or for
     # shutdown
-    assert listener._db.in_transaction
+    assert await listener._db.in_transaction
     assert listener._commit_task is not None
     assert not listener._commit_task.done()
 
@@ -2706,7 +2705,7 @@ async def test_shutdown_survives_failed_commit(tmp_path, caplog):
     await listener.shutdown()
 
     assert "Failed to commit pending changes during shutdown" in caplog.text
-    assert not listener._db.is_alive()
+    assert not listener._db_thread.is_alive()
     assert await _read_count(db, "groups") == 0
 
 
@@ -2716,12 +2715,12 @@ async def test_shutdown_closes_database_on_failure(tmp_path):
     app = await make_app_with_db(db, commit_interval=10.0)
     listener = app._dblistener
 
-    listener._set_isolation_level = AsyncMock(side_effect=RuntimeError("boom"))
+    listener.execute = MagicMock(side_effect=RuntimeError("boom"))
 
     with pytest.raises(RuntimeError):
         await listener.shutdown()
 
-    assert not listener._db.is_alive()
+    assert not listener._db_thread.is_alive()
 
 
 async def test_shutdown_rolls_back_persistently_failing_commit(tmp_path, caplog):
@@ -2741,7 +2740,7 @@ async def test_shutdown_rolls_back_persistently_failing_commit(tmp_path, caplog)
     await listener.shutdown()
 
     assert "Failed to commit pending changes during shutdown" in caplog.text
-    assert not listener._db.is_alive()
+    assert not listener._db_thread.is_alive()
     assert await _read_count(db, "endpoints") == 0
 
 

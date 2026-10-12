@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 import contextlib
 from datetime import UTC, datetime, timedelta
 import json
 import logging
+import queue
 import re
-import sqlite3
+import threading
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-import aiosqlite
+import apsw
+import apsw.aio
 
 import zigpy.appdb_schemas
 import zigpy.backups
@@ -48,10 +51,10 @@ if TYPE_CHECKING:
 
 MIN_SQLITE_VERSION = (3, 24, 0)
 
-if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
+if tuple(map(int, apsw.sqlite_lib_version().split("."))) < MIN_SQLITE_VERSION:
     raise RuntimeError(
         f"zigpy requires SQLite {'.'.join(map(str, MIN_SQLITE_VERSION))} or newer "
-        f"(found {sqlite3.sqlite_version})."
+        f"(found {apsw.sqlite_lib_version()})."
     )
 
 LOGGER = logging.getLogger(__name__)
@@ -61,6 +64,7 @@ DB_V = f"_v{DB_VERSION}"
 
 UNIX_EPOCH = datetime.fromtimestamp(0, tz=UTC)
 DB_V_REGEX = re.compile(r"(?:_v\d+)?$")
+DML_REGEX = re.compile(r"\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
 
 MIN_UPDATE_DELTA = timedelta(seconds=30).total_seconds()
 
@@ -86,30 +90,102 @@ class AttributeCacheRow(NamedTuple):
     last_updated: float
 
 
-def _register_sqlite_adapters():
-    def adapt_ieee(eui64):
-        return str(eui64)
+def _convert_binding(cursor: apsw.Cursor, num: int, value: Any) -> str:
+    if isinstance(value, t.EUI64):
+        return str(value)
 
-    sqlite3.register_adapter(t.EUI64, adapt_ieee)
-    sqlite3.register_adapter(t.ExtendedPanId, adapt_ieee)
-
-    def convert_ieee(s):
-        return t.EUI64.convert(s.decode())
-
-    sqlite3.register_converter("ieee", convert_ieee)
+    raise TypeError(f"Unsupported SQLite binding {value!r}")
 
 
-def aiosqlite_connect(
-    database: str, iter_chunk_size: int = 64, **kwargs
-) -> aiosqlite.Connection:
-    """Copy of the the `aiosqlite.connect` function that connects using either the built-in
-    `sqlite3` module or the imported `pysqlite3` module.
+def _convert_row(cursor: apsw.Cursor, row: apsw.SQLiteValues) -> tuple[Any, ...]:
+    return tuple(
+        t.EUI64.convert(value) if decltype == "ieee" and value is not None else value
+        for (_, decltype), value in zip(cursor.get_description(), row, strict=True)
+    )
+
+
+class DaemonAsyncIO(apsw.aio.AsyncIO):
+    """apsw asyncio controller with a daemon worker thread, which cannot block
+    interpreter shutdown if the connection is never closed.
     """
 
-    return aiosqlite.Connection(
-        connector=lambda: sqlite3.connect(str(database), **kwargs),
-        iter_chunk_size=iter_chunk_size,
-    )
+    def __init__(self, *, thread_name: str = "zigpy apsw worker") -> None:
+        # Mirrors `apsw.aio.AsyncIO.__init__`
+        self.queue = queue.SimpleQueue()
+        self.loop = asyncio.get_running_loop()
+        self.thread = threading.Thread(
+            name=thread_name, target=self.worker_thread_run, daemon=True
+        )
+        self.thread.start()
+
+
+class Connection(apsw.Connection):
+    """Async apsw connection emulating the `sqlite3` module's legacy transaction
+    control: DML statements implicitly begin a transaction.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Async connections run `__init__` in the worker thread
+        super().__init__(*args, **kwargs)
+        self.convert_binding = _convert_binding
+        self.row_trace = _convert_row
+
+    def _begin_implicitly(self, sql: str) -> None:
+        if self.get_autocommit() and DML_REGEX.match(sql):
+            self.execute("BEGIN")
+
+    def _execute_legacy(self, sql: str, bindings: apsw.Bindings | None) -> apsw.Cursor:
+        self._begin_implicitly(sql)
+        return self.execute(sql, bindings)
+
+    def _executemany_legacy(
+        self, sql: str, bindings: list[apsw.Bindings]
+    ) -> apsw.Cursor:
+        self._begin_implicitly(sql)
+        return self.executemany(sql, bindings)
+
+    def _commit(self) -> None:
+        if not self.get_autocommit():
+            self.execute("COMMIT")
+
+    def _rollback(self) -> None:
+        if not self.get_autocommit():
+            self.execute("ROLLBACK")
+
+    async def execute_legacy(
+        self, sql: str, bindings: apsw.Bindings | None = None
+    ) -> apsw.Cursor:
+        return await self.async_run(self._execute_legacy, sql, bindings)
+
+    async def executemany_legacy(
+        self, sql: str, bindings: list[apsw.Bindings]
+    ) -> apsw.Cursor:
+        return await self.async_run(self._executemany_legacy, sql, bindings)
+
+    async def commit(self) -> None:
+        await self.async_run(self._commit)
+
+    async def rollback(self) -> None:
+        await self.async_run(self._rollback)
+
+
+class CursorContext:
+    """Allows both `await execute(...)` and `async with execute(...) as cursor`."""
+
+    def __init__(self, coro: Coroutine[Any, Any, apsw.Cursor]) -> None:
+        self._coro = coro
+        self._cursor: apsw.Cursor | None = None
+
+    def __await__(self):
+        return self._coro.__await__()
+
+    async def __aenter__(self) -> apsw.Cursor:
+        self._cursor = await self._coro
+        return self._cursor
+
+    async def __aexit__(self, *exc_info) -> None:
+        assert self._cursor is not None
+        await self._cursor.aclose()
 
 
 def decode_str_attribute(value: str | bytes) -> str:
@@ -122,12 +198,11 @@ def decode_str_attribute(value: str | bytes) -> str:
 class PersistingListener(zigpy.util.CatchingTaskMixin):
     def __init__(
         self,
-        connection: aiosqlite.Connection,
+        connection: Connection,
         application: ControllerApplication,
     ) -> None:
-        _register_sqlite_adapters()
-
         self._db = connection
+        self._db_thread = connection.async_controller.thread
         self._application = application
         self._callback_handlers: asyncio.Queue = asyncio.Queue()
         self.running = False
@@ -155,12 +230,9 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 )
 
         # Truncate the SQLite journal file instead of deleting it after transactions
-        await self._set_isolation_level(None)
         await self.execute("PRAGMA journal_mode = WAL")
         await self.execute("PRAGMA synchronous = normal")
         await self.execute("PRAGMA temp_store = memory")
-        await self._set_isolation_level("DEFERRED")
-
         await self.execute("PRAGMA foreign_keys = ON")
         await self._run_migrations()
 
@@ -169,12 +241,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         cls, database_file: str, app: ControllerApplication
     ) -> PersistingListener:
         """Create an instance of persisting listener."""
-        sqlite_conn = await aiosqlite_connect(
-            database_file,
-            detect_types=sqlite3.PARSE_DECLTYPES,
-            isolation_level="DEFERRED",  # The default is "", an alias for "DEFERRED"
-        )
-        listener = cls(sqlite_conn, app)
+        with apsw.aio.contextvar_set(apsw.async_controller, DaemonAsyncIO):
+            connection = await Connection.as_async(str(database_file))
+
+        listener = cls(connection, app)
 
         try:
             await listener.initialize_tables()
@@ -193,7 +263,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             assert handler
             try:
                 await handler(*args)
-            except sqlite3.Error as exc:
+            except apsw.Error as exc:
                 LOGGER.debug(
                     "Error handling '%s' event with %s params: %s",
                     cb_name,
@@ -238,7 +308,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
     async def _flush_commit(self) -> None:
         """Commit any open transaction, invoked by the worker after the delay."""
-        if not self._db.in_transaction:
+        if not await self._db.in_transaction:
             return
 
         try:
@@ -259,24 +329,18 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             self._commit_task = None
 
         try:
-            if self._db.in_transaction:
+            if await self._db.in_transaction:
                 try:
                     await self._db.commit()
                 except Exception:
                     LOGGER.exception("Failed to commit pending changes during shutdown")
-                    # Otherwise, disabling the isolation level below implicitly
-                    # retries the failed `COMMIT`
                     await self._db.rollback()
 
             # Delete the journal on shutdown
-            await self._set_isolation_level(None)
             await self.execute("PRAGMA wal_checkpoint;")
-            await self._set_isolation_level("DEFERRED")
         finally:
-            await self._db.close()
-
-            # FIXME: aiosqlite's thread won't always be closed immediately
-            await asyncio.get_running_loop().run_in_executor(None, self._db.join)
+            await self._db.aclose()
+            await asyncio.get_running_loop().run_in_executor(None, self._db_thread.join)
 
     def register_cluster_events(self, cluster) -> None:
         cluster.on_event(AttributeReadEvent.event_type, self.on_attribute_read)
@@ -303,12 +367,11 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             return
         self._callback_handlers.put_nowait((cb_name, args))
 
-    async def _set_isolation_level(self, level: str | None):
-        """Set the SQLite statement isolation level in a thread-safe way."""
-        await self._db._execute(lambda: setattr(self._db, "isolation_level", level))
+    def execute(self, sql: str, bindings: apsw.Bindings | None = None) -> CursorContext:
+        return CursorContext(self._db.execute_legacy(sql, bindings))
 
-    def execute(self, *args, **kwargs):
-        return self._db.execute(*args, **kwargs)
+    async def executemany(self, sql: str, bindings: list[apsw.Bindings]) -> None:
+        await self._db.executemany_legacy(sql, bindings)
 
     async def executescript(self, sql):
         """Naive replacement for `sqlite3.Cursor.executescript` that does not execute a
@@ -318,8 +381,8 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         # XXX: This will break if you use a semicolon anywhere but at the end of a line
         for statement in sql.split(";"):
-            # Strip SQL comments so that pysqlite3's implicit transaction DML detection
-            # (which doesn't skip comments) sees the actual statement keyword
+            # Strip SQL comments so that the implicit transaction DML detection (which
+            # doesn't skip comments) sees the actual statement keyword
             statement = re.sub(r"--[^\n]*", "", statement)
 
             await self.execute(statement)
@@ -381,7 +444,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         rows = [(ieee, *neighbor.as_tuple()) for neighbor in neighbors]
 
-        await self._db.executemany(
+        await self.executemany(
             f"INSERT INTO neighbors{DB_V} VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows
         )
         await self._commit()
@@ -395,7 +458,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         rows = [(ieee, *route.as_tuple()) for route in routes]
 
-        await self._db.executemany(
+        await self.executemany(
             f"INSERT INTO routes{DB_V} VALUES (?,?,?,?,?,?,?,?)", rows
         )
         await self._commit()
@@ -517,7 +580,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         device_type=excluded.device_type,
                         status=excluded.status"""
 
-        await self._db.executemany(q, rows)
+        await self.executemany(q, rows)
 
     async def _save_node_descriptor(self, device: Device) -> None:
         if device.node_desc is None:
@@ -556,7 +619,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         q = f"""INSERT INTO clusters{DB_V} VALUES (?, ?, ?, ?)
                     ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id)
                     DO NOTHING"""
-        await self._db.executemany(q, clusters)
+        await self.executemany(q, clusters)
 
     async def _save_attribute_cache(self, ep: Endpoint) -> None:
         clusters = [
@@ -581,7 +644,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx)
                     DO UPDATE SET status=excluded.status, value=excluded.value, last_updated=excluded.last_updated"""
-        await self._db.executemany(q, clusters)
+        await self.executemany(q, clusters)
 
     async def _save_unsupported_attributes(self, ep: Endpoint) -> None:
         clusters = [
@@ -603,7 +666,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (ieee, endpoint_id, cluster_type, cluster_id, attr_id, manufacturer_code_idx)
                     DO NOTHING"""
-        await self._db.executemany(q, clusters)
+        await self.executemany(q, clusters)
 
     async def _save_ota_query_cache(self, device: Device) -> None:
         rows = []
@@ -633,7 +696,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         current_file_version=excluded.current_file_version,
                         hardware_version=excluded.hardware_version,
                         last_updated=excluded.last_updated"""
-            await self._db.executemany(q, rows)
+            await self.executemany(q, rows)
 
     def on_attribute_read(self, event: AttributeReadEvent) -> None:
         self.enqueue("_save_attribute", event)
@@ -986,9 +1049,9 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                             "value": row.value,
                             "last_updated": row.last_updated,
                         },
-                    ) as cursor:
+                    ):
                         # A resolved row already exists, it will populate the cache
-                        if cursor.rowcount == 0:
+                        if await self._db.changes() == 0:
                             continue
 
             try:
@@ -1366,7 +1429,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 async for row in cursor:
                     try:
                         await self.execute(insert_sql, row)
-                    except sqlite3.IntegrityError as e:
+                    except apsw.ConstraintError as e:
                         if errors == "raise":
                             raise
                         elif errors == "warn":

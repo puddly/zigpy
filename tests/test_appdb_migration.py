@@ -1,10 +1,11 @@
+import asyncio
 from datetime import UTC, datetime
 import logging
 import pathlib
 import sqlite3
 from sqlite3.dump import _iterdump as iterdump
 
-from aiosqlite.context import contextmanager
+import apsw
 import pytest
 
 from tests.async_mock import AsyncMock, MagicMock, patch
@@ -19,8 +20,6 @@ import zigpy.zcl
 from zigpy.zcl.clusters.general import Basic
 from zigpy.zcl.foundation import BaseAttributeDefs, Status, ZCLAttributeDef
 from zigpy.zdo import types as zdo_t
-
-pytestmark = pytest.mark.usefixtures("auto_kill_aiosqlite")
 
 
 @pytest.fixture
@@ -451,8 +450,8 @@ async def test_v5_to_v7_migration(test_db):
 
 async def test_migration_missing_tables(app):
     conn = MagicMock()
-    conn.close = AsyncMock()
-    conn.in_transaction = False
+    conn.aclose = AsyncMock()
+    conn.in_transaction = asyncio.sleep(0, result=False)
 
     appdb = zigpy.appdb.PersistingListener(conn, app)
 
@@ -461,9 +460,9 @@ async def test_migration_missing_tables(app):
     )
 
     mock_execute = AsyncMock()
-    appdb.execute = contextmanager(mock_execute)
-
-    appdb._db._execute = AsyncMock()
+    appdb.execute = lambda *args, **kwargs: zigpy.appdb.CursorContext(
+        mock_execute(*args, **kwargs)
+    )
 
     # Migrations must explicitly specify all old tables, even if they will be untouched
     with pytest.raises(RuntimeError):
@@ -501,7 +500,7 @@ async def test_migrate_tables_integrity_error_raises(tmp_path):
 
     app._dblistener._get_table_versions = AsyncMock(return_value={"src_v1": "1"})
 
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(apsw.ConstraintError):
         await app._dblistener._migrate_tables({"src_v1": "dst_v2"})
 
     await app.shutdown()

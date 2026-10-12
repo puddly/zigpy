@@ -5,7 +5,6 @@ from collections.abc import (
     AsyncIterator,
     Callable,
     Coroutine,
-    Generator,
     Iterable,
     Mapping,
     Sequence,
@@ -15,14 +14,12 @@ from datetime import UTC, datetime, timedelta
 import functools
 import json
 import logging
-import queue
 import re
+import sqlite3
 import sys
-import threading
 from typing import TYPE_CHECKING, Any, NamedTuple, ParamSpec
 
-import apsw
-import apsw.aio
+import aiosqlite
 
 import zigpy.appdb_schemas
 import zigpy.backups
@@ -61,10 +58,10 @@ if TYPE_CHECKING:
 
 MIN_SQLITE_VERSION = (3, 24, 0)
 
-if tuple(map(int, apsw.sqlite_lib_version().split("."))) < MIN_SQLITE_VERSION:
+if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
     raise RuntimeError(
         f"zigpy requires SQLite {'.'.join(map(str, MIN_SQLITE_VERSION))} or newer "
-        f"(found {apsw.sqlite_lib_version()})."
+        f"(found {sqlite3.sqlite_version})."
     )
 
 LOGGER = logging.getLogger(__name__)
@@ -101,87 +98,30 @@ class AttributeCacheRow(NamedTuple):
     last_updated: float
 
 
-def _convert_binding(cursor: apsw.Cursor, num: int, value: Any) -> str:
-    if isinstance(value, t.EUI64):
-        return str(value)
+def _register_sqlite_adapters():
+    def adapt_ieee(eui64):
+        return str(eui64)
 
-    raise TypeError(f"Unsupported SQLite binding {value!r}")
+    sqlite3.register_adapter(t.EUI64, adapt_ieee)
+    sqlite3.register_adapter(t.ExtendedPanId, adapt_ieee)
 
+    def convert_ieee(s):
+        return t.EUI64.convert(s.decode())
 
-def _convert_value(decltype: str | None, value: apsw.SQLiteValue) -> Any:
-    if decltype == "ieee" and value is not None:
-        assert isinstance(value, str)
-        return t.EUI64.convert(value)
-
-    return value
+    sqlite3.register_converter("ieee", convert_ieee)
 
 
-def _convert_row(cursor: apsw.Cursor, row: apsw.SQLiteValues) -> tuple[Any, ...]:
-    return tuple(
-        _convert_value(decltype, value)
-        for (_, decltype), value in zip(cursor.get_description(), row, strict=True)
+def aiosqlite_connect(
+    database: str, iter_chunk_size: int = 64, **kwargs
+) -> aiosqlite.Connection:
+    """Copy of the the `aiosqlite.connect` function that connects using either the built-in
+    `sqlite3` module or the imported `pysqlite3` module.
+    """
+
+    return aiosqlite.Connection(
+        connector=lambda: sqlite3.connect(str(database), **kwargs),
+        iter_chunk_size=iter_chunk_size,
     )
-
-
-class DaemonAsyncIO(apsw.aio.AsyncIO):
-    """apsw asyncio controller whose worker thread cannot block interpreter exit."""
-
-    def __init__(self, *, thread_name: str = "zigpy apsw worker") -> None:
-        # Mirrors `apsw.aio.AsyncIO.__init__`
-        self.queue = queue.SimpleQueue()
-        self.loop = asyncio.get_running_loop()
-        self.thread = threading.Thread(
-            name=thread_name, target=self.worker_thread_run, daemon=True
-        )
-        self.thread.start()
-
-
-def _begin_savepoint(db: apsw.Connection) -> None:
-    """Open a savepoint within a transaction. Runs in the worker thread."""
-    # Releasing a savepoint opened outside of a transaction would commit it
-    if db.get_autocommit():
-        db.execute("BEGIN")
-
-    db.execute("SAVEPOINT write")
-
-
-def _rollback_savepoint(db: apsw.Connection) -> None:
-    """Undo the writes since the savepoint. Runs in the worker thread."""
-    # Some errors already roll back the whole transaction
-    if not db.get_autocommit():
-        db.execute("ROLLBACK TO write; RELEASE write")
-
-
-def _commit_transaction(db: apsw.Connection) -> None:
-    """Commit the open transaction, if any. Runs in the worker thread, so it's atomic."""
-    if not db.get_autocommit():
-        db.execute("COMMIT")
-
-
-def _rollback_transaction(db: apsw.Connection) -> None:
-    """Roll back the open transaction, if any. Runs in the worker thread, so it's atomic."""
-    # Some failed commits already roll back the transaction
-    if not db.get_autocommit():
-        db.execute("ROLLBACK")
-
-
-class CursorResult:
-    """`await` it for the cursor, or `async with` it to also close the cursor on exit."""
-
-    def __init__(self, coro: Coroutine[Any, Any, Any]) -> None:
-        self._coro = coro
-        self._cursor: Any = None
-
-    def __await__(self) -> Generator[Any, None, Any]:
-        return self._coro.__await__()
-
-    async def __aenter__(self) -> Any:
-        self._cursor = await self._coro
-        return self._cursor
-
-    async def __aexit__(self, *exc_info: object) -> None:
-        # Resets the statement even if rows remain
-        await self._cursor.aclose()
 
 
 def decode_str_attribute(value: str | bytes) -> str:
@@ -194,14 +134,12 @@ def decode_str_attribute(value: str | bytes) -> str:
 class PersistingListener(zigpy.util.CatchingTaskMixin):
     def __init__(
         self,
-        connection: apsw.AsyncConnection,
+        connection: aiosqlite.Connection,
         application: ControllerApplication,
     ) -> None:
-        controller = connection.async_controller
-        assert isinstance(controller, DaemonAsyncIO)
+        _register_sqlite_adapters()
 
         self._db = connection
-        self._db_thread = controller.thread
         self._application = application
         self.running = False
         self._write_tasks: set[asyncio.Task[None]] = set()
@@ -242,16 +180,13 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         cls, database_file: str, app: ControllerApplication
     ) -> PersistingListener:
         """Create an instance of persisting listener."""
-        # apsw's stubs declare `async_controller` as a type, not a `ContextVar`
-        with apsw.aio.contextvar_set(apsw.async_controller, DaemonAsyncIO):  # type: ignore[arg-type,attr-defined]
-            connection = await apsw.Connection.as_async(str(database_file))
-
-        await connection.async_run(
-            setattr, connection, "convert_binding", _convert_binding
+        sqlite_conn = await aiosqlite_connect(
+            database_file,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            # Transactions are explicit, `sqlite3` must not begin them implicitly
+            isolation_level=None,
         )
-        await connection.async_run(setattr, connection, "row_trace", _convert_row)
-
-        listener = cls(connection, app)
+        listener = cls(sqlite_conn, app)
 
         try:
             await listener.initialize_tables()
@@ -318,7 +253,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         exc = task.exception()
 
-        if isinstance(exc, apsw.Error):
+        if isinstance(exc, sqlite3.Error):
             LOGGER.debug(
                 "Error handling '%s' event with %s params: %s",
                 func.__name__,
@@ -341,7 +276,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         """
         if force or self._commit_interval <= 0:
             try:
-                await self._db.async_run(_commit_transaction, self._db)
+                await self._db.commit()
             except Exception:
                 # Retry the uncommitted writes after another interval
                 if self._commit_interval > 0:
@@ -365,7 +300,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def _flush_commit(self) -> None:
         """Commit any open transaction, scheduled after the delay."""
         try:
-            await self._db.async_run(_commit_transaction, self._db)
+            await self._db.commit()
         except Exception:
             LOGGER.exception("Failed to flush pending database commits")
             self._arm_commit_timer()
@@ -384,16 +319,20 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
 
         try:
             try:
-                await self._db.async_run(_commit_transaction, self._db)
+                await self._db.commit()
             except Exception:
                 LOGGER.exception("Failed to commit pending changes during shutdown")
-                await self._db.async_run(_rollback_transaction, self._db)
+
+                # Does nothing if the failed commit already rolled back the transaction
+                await self._db.rollback()
 
             # Delete the journal on shutdown
             await self.execute("PRAGMA wal_checkpoint;")
         finally:
-            await self._db.aclose()
-            await asyncio.get_running_loop().run_in_executor(None, self._db_thread.join)
+            await self._db.close()
+
+            # FIXME: aiosqlite's thread won't always be closed immediately
+            await asyncio.get_running_loop().run_in_executor(None, self._db.join)
 
     def register_cluster_events(self, cluster) -> None:
         cluster.on_event(AttributeReadEvent.event_type, self.on_attribute_read)
@@ -419,27 +358,56 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         # Only scheduled writes hold the lock, so this never interleaves with another
         assert self._write_lock.locked()
 
-        await self._db.async_run(_begin_savepoint, self._db)
+        # Releasing a savepoint opened outside of a transaction would commit it
+        if not self._db.in_transaction:
+            await self.execute("BEGIN")
+
+        await self.execute("SAVEPOINT write")
 
         try:
             yield
         except BaseException:
-            await self._db.async_run(_rollback_savepoint, self._db)
+            # Some errors already roll back the whole transaction
+            if self._db.in_transaction:
+                await self.execute("ROLLBACK TO write")
+                await self.execute("RELEASE write")
+
             raise
 
-        await self._db.execute("RELEASE write")
+        await self.execute("RELEASE write")
         await self._commit(force=force_commit)
 
-    # Bindings are `Any`: `_convert_binding` handles types apsw doesn't know about
     def execute(
         self, sql: str, bindings: Sequence[Any] | Mapping[str, Any] | None = None
-    ) -> CursorResult:
-        return CursorResult(self._db.execute(sql, bindings))
+    ):
+        return self._db.execute(sql, bindings)
 
     async def executemany(
         self, sql: str, bindings: Iterable[Sequence[Any] | Mapping[str, Any]]
     ) -> None:
         await self._db.executemany(sql, bindings)
+
+    async def executescript(self, sql: str) -> None:
+        """Naive replacement for `sqlite3.Cursor.executescript` that does not execute a
+        `COMMIT` before running the script. This extra `COMMIT` breaks transactions that
+        run scripts.
+        """
+
+        # XXX: This will break if you use a semicolon anywhere but at the end of a line
+        for statement in sql.split(";"):
+            await self.execute(statement)
+
+    @contextlib.asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        await self.execute("BEGIN TRANSACTION")
+
+        try:
+            yield
+        except Exception:  # noqa: BLE001
+            await self.execute("ROLLBACK")
+            raise
+        else:
+            await self.execute("COMMIT")
 
     def device_joined(self, device: Device) -> None:
         self._schedule(self._update_device_nwk, device.ieee, device.nwk)
@@ -986,7 +954,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         # Second pass: populate the attribute cache for the final device state and
         # migrate attributes with unknown manufacturer codes to the correct codes. Only
         # the migration pass modifies the database so we do it in a transaction.
-        async with self._db:
+        async with self._transaction():
             await self._populate_attribute_cache(all_attributes, migrate=True)
 
         await self._load_groups()
@@ -1099,7 +1067,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         },
                     )
 
-                    await self.execute(
+                    cursor = await self.execute(
                         f"""
                         INSERT OR IGNORE INTO attributes_cache{DB_V}
                             (ieee, endpoint_id, cluster_type, cluster_id,
@@ -1120,7 +1088,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     )
 
                     # A resolved row already exists, it will populate the cache
-                    if await self._db.changes() == 0:
+                    if cursor.rowcount == 0:
                         continue
 
             try:
@@ -1407,8 +1375,8 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         if db_version == 0 and not tables:
             # If this is a brand new database, just load the current schema. Creating it
             # in a transaction never leaves the schema version set with tables missing.
-            async with self._db:
-                await self.execute(zigpy.appdb_schemas.SCHEMAS[DB_VERSION])
+            async with self._transaction():
+                await self.executescript(zigpy.appdb_schemas.SCHEMAS[DB_VERSION])
             return False
         elif db_version > DB_VERSION:
             LOGGER.error(
@@ -1421,7 +1389,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             return False
 
         # All migrations must succeed. If any fail, the database is not touched.
-        async with self._db:
+        async with self._transaction():
             for migration, to_db_version in [
                 (self._migrate_to_v4, 4),
                 (self._migrate_to_v5, 5),
@@ -1442,7 +1410,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 LOGGER.info(
                     "Migrating database from v%d to v%d", db_version, to_db_version
                 )
-                await self.execute(zigpy.appdb_schemas.SCHEMAS[to_db_version])
+                await self.executescript(zigpy.appdb_schemas.SCHEMAS[to_db_version])
                 await migration()
 
                 db_version = to_db_version
@@ -1488,7 +1456,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 async for row in cursor:
                     try:
                         await self.execute(insert_sql, row)
-                    except apsw.ConstraintError as e:
+                    except sqlite3.IntegrityError as e:
                         if errors == "raise":
                             raise
                         elif errors == "warn":

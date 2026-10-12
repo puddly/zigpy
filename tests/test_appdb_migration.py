@@ -4,7 +4,7 @@ import pathlib
 import sqlite3
 from sqlite3.dump import _iterdump as iterdump
 
-import apsw
+from aiosqlite.context import contextmanager
 import pytest
 
 from tests.async_mock import AsyncMock, MagicMock, patch
@@ -19,6 +19,8 @@ import zigpy.zcl
 from zigpy.zcl.clusters.general import Basic
 from zigpy.zcl.foundation import BaseAttributeDefs, Status, ZCLAttributeDef
 from zigpy.zdo import types as zdo_t
+
+pytestmark = pytest.mark.usefixtures("auto_kill_aiosqlite")
 
 
 @pytest.fixture
@@ -449,10 +451,9 @@ async def test_v5_to_v7_migration(test_db):
 
 async def test_migration_missing_tables(app):
     conn = MagicMock()
-    conn.async_controller = MagicMock(spec=zigpy.appdb.DaemonAsyncIO)
-    conn.async_controller.thread = MagicMock()
-    conn.async_run = AsyncMock()
-    conn.aclose = AsyncMock()
+    conn.close = AsyncMock()
+    conn.commit = AsyncMock()
+    conn.rollback = AsyncMock()
 
     appdb = zigpy.appdb.PersistingListener(conn, app)
 
@@ -460,10 +461,8 @@ async def test_migration_missing_tables(app):
         return_value={"table1_v1": "1", "table1": "", "table2_v1": "1"}
     )
 
-    mock_execute = AsyncMock(return_value=MagicMock(aclose=AsyncMock()))
-    appdb.execute = lambda *args, **kwargs: zigpy.appdb.CursorResult(
-        mock_execute(*args, **kwargs)
-    )
+    mock_execute = AsyncMock()
+    appdb.execute = contextmanager(mock_execute)
 
     # Migrations must explicitly specify all old tables, even if they will be untouched
     with pytest.raises(RuntimeError):
@@ -501,7 +500,7 @@ async def test_migrate_tables_integrity_error_raises(tmp_path):
 
     app._dblistener._get_table_versions = AsyncMock(return_value={"src_v1": "1"})
 
-    with pytest.raises(apsw.ConstraintError):
+    with pytest.raises(sqlite3.IntegrityError):
         await app._dblistener._migrate_tables({"src_v1": "dst_v2"})
 
     await app.shutdown()
@@ -797,7 +796,7 @@ async def test_new_database_schema_is_atomic(tmp_path):
         zigpy.appdb_schemas.SCHEMAS,
         {zigpy.appdb.DB_VERSION: schema + "\nCREATE TABLE broken (;"},
     ):
-        with pytest.raises(apsw.SQLError):
+        with pytest.raises(sqlite3.OperationalError):
             await make_app_with_db(db_path)
 
     assert dump_db(db_path) == (0, "BEGIN TRANSACTION;\nCOMMIT;")

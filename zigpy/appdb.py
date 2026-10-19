@@ -475,7 +475,9 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     def raw_device_initialized(self, device: Device) -> None:
         if isinstance(device, GreenPowerDevice):
             # Snapshot the row now, for the same reason a Zigbee device is cloned
-            self.enqueue("_save_gp_device", self._gp_device_row(device))
+            self.enqueue(
+                "_save_gp_device", self._gp_device_row(device), list(device.proxies)
+            )
             return
 
         # We work with a clone of a device so that quirks that run in the same event
@@ -851,7 +853,9 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             "last_seen": device.last_seen or UNIX_EPOCH.timestamp(),
         }
 
-    async def _save_gp_device(self, row: dict[str, Any]) -> None:
+    async def _save_gp_device(
+        self, row: dict[str, Any], proxies: list[t.EUI64]
+    ) -> None:
         columns = ", ".join(row)
         values = ", ".join(f":{column}" for column in row)
         updates = ", ".join(f"{column}=excluded.{column}" for column in row)
@@ -860,6 +864,11 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             f"INSERT INTO gp_devices{DB_V} ({columns}) VALUES ({values})"
             f" ON CONFLICT (ieee) DO UPDATE SET {updates}",
             row,
+        )
+        await self.execute(f"DELETE FROM gp_proxies{DB_V} WHERE ieee=?", (row["ieee"],))
+        await self._db.executemany(
+            f"INSERT INTO gp_proxies{DB_V} (ieee, proxy_ieee) VALUES (?, ?)",
+            [(row["ieee"], proxy) for proxy in proxies],
         )
         await self._commit(force=True)
 
@@ -915,6 +924,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         LOGGER.debug("Loading application state")
         await self._load_devices()
         await self._load_gp_devices()
+        await self._load_gp_proxies()
         await self._load_node_descriptors()
         await self._load_endpoints()
         await self._load_clusters()
@@ -1386,6 +1396,15 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                     device.last_seen = last_seen
 
                 self._application.devices[device.ieee] = device
+
+    async def _load_gp_proxies(self) -> None:
+        async with self.execute(
+            f"SELECT ieee, proxy_ieee FROM gp_proxies{DB_V}"
+        ) as cursor:
+            async for ieee, proxy_ieee in cursor:
+                device = self._application.devices[ieee]
+                assert isinstance(device, GreenPowerDevice)
+                device.proxies.append(proxy_ieee)
 
     async def _register_device_listeners(self) -> None:
         for dev in self._application.devices.values():

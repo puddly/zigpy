@@ -243,3 +243,21 @@ CREATE TABLE gp_devices_v16 (
 
 CREATE UNIQUE INDEX gp_devices_idx_v16
     ON gp_devices_v16(ieee);
+
+
+-- The routers paired as a Green Power device's proxies
+DROP TABLE IF EXISTS gp_proxies_v16;
+CREATE TABLE gp_proxies_v16 (
+    ieee ieee NOT NULL,
+    proxy_ieee ieee NOT NULL,
+
+    FOREIGN KEY(ieee)
+        REFERENCES gp_devices_v16(ieee)
+        ON DELETE CASCADE,
+    FOREIGN KEY(proxy_ieee)
+        REFERENCES devices_v16(ieee)
+        ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX gp_proxies_idx_v16
+    ON gp_proxies_v16(ieee, proxy_ieee);

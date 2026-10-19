@@ -7,6 +7,7 @@ Opens and closes the GP commissioning window, handles the GPD commissioning comm
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -14,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 from cryptography.exceptions import InvalidTag
 
 from zigpy.datastructures import Debouncer
-from zigpy.device import GP_DUPLICATE_TIMEOUT, GreenPowerDevice
+from zigpy.device import GP_DUPLICATE_TIMEOUT, GreenPowerDevice, ZigbeeDevice
+import zigpy.exceptions
 from zigpy.profiles import zgp as zgp_profile
 import zigpy.types as t
 from zigpy.util import CreateTaskMixin
@@ -27,6 +29,7 @@ from zigpy.zcl.clusters.greenpower import (
     TempMasterTxChannel,
 )
 import zigpy.zdo.types as zdo_types
+from zigpy.zgp.backbone import select_backbone
 from zigpy.zgp.commands import (
     GPChannelConfigurationPayload,
     GPChannelRequestPayload,
@@ -51,12 +54,26 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+# Proxies paired with each GPD. Each one forwards every GPDF, so this is the number of
+# copies the sink gets and the fault tolerance of the pairing.
+GP_PROXIES_PER_DEVICE = 2
 
-def derived_group(device: GreenPowerDevice) -> t.Group:
-    """The DGroupID proxies forward a GPD's GPDFs to in derived groupcast mode."""
-    # Derived from the GPD ID exactly like the alias (A.3.6.1.4), and the device's NWK
-    # address is that alias
-    return t.Group(device.nwk)
+# How long after the first forwarded copy of a commissioning GPDF the proxies in
+# commissioning mode are given to deliver theirs. Basic proxies send unicast
+# commissioning notifications 32 ms after the GPDF (Dmin_b), plus routing.
+GP_CENSUS_SETTLE = 0.5
+
+# Spacing of the pairings re-sent to the proxies at startup
+GP_PAIRING_RESEND_INTERVAL = 1.0
+
+
+@dataclasses.dataclass
+class ProxyHearing:
+    """How well a proxy heard a GPD during its commissioning."""
+
+    frames: int = 0
+    lqi: int = 0
+    rssi: int = -128
 
 
 def commissioning_security(
@@ -142,19 +159,57 @@ class GreenPowerManager(CreateTaskMixin):
         # GPDs in bidirectional commissioning, until their Success GPDF arrives. They
         # outlive a lapse of the window, which a client may keep re-requesting.
         self._pending_devices: dict[t.EUI64, GreenPowerDevice] = {}
+        # GPDs whose commissioning is being finalized, by IEEE
+        self._finalizing: set[t.EUI64] = set()
+
+        # The routers told to enter commissioning mode, to tell them to leave it
+        self._commissioning_proxies: set[t.EUI64] = set()
+        # The last backbone, kept while it still suffices
+        self._backbone: set[t.EUI64] = set()
+        # Which proxies heard a GPD being commissioned, and how well
+        self._census: dict[SrcID, dict[t.NWK, ProxyHearing]] = {}
 
     async def startup(self) -> None:
-        """Join the derived groups of all commissioned GPDs, to receive their GPDFs."""
-        groups = {
-            derived_group(device)
-            for device in self._application.devices.values()
-            if isinstance(device, GreenPowerDevice)
-        }
+        """Re-send every GPD's pairings to its proxies, in case any lost them."""
+        self.create_task(self._resend_pairings(), "gp_resend_pairings")
 
-        for group in sorted(groups):
-            await self._application.subscribe_to_multicast_group(
-                group, endpoint_id=GP_ENDPOINT
-            )
+    async def _resend_pairings(self) -> None:
+        for device in list(self._application.devices.values()):
+            if not isinstance(device, GreenPowerDevice):
+                continue
+
+            for proxy in list(device.proxies):
+                await asyncio.sleep(GP_PAIRING_RESEND_INTERVAL)
+
+                # Removed in the meantime
+                if self._application.devices.get(device.ieee) is not device:
+                    break
+
+                try:
+                    await self.send_pairing(device, add_sink=True, proxy=proxy)
+                except zigpy.exceptions.DeliveryError:
+                    LOGGER.warning(
+                        "Failed to re-send the pairing of %r to %s", device, proxy
+                    )
+
+    def backbone(self) -> set[t.EUI64]:
+        """The routers to involve in commissioning, from the last topology scans."""
+        coordinator = self._application.state.node_info.ieee
+        self._backbone = select_backbone(
+            coordinator=coordinator,
+            routers=[
+                device.ieee
+                for device in self._application.devices.values()
+                if isinstance(device, ZigbeeDevice)
+                and device.ieee != coordinator
+                and device.node_desc is not None
+                and device.node_desc.is_router
+            ],
+            neighbors=self._application.topology.neighbors,
+            incumbent=self._backbone,
+        )
+
+        return set(self._backbone)
 
     async def shutdown(self) -> None:
         """Cancel commissioning in progress and close the window."""
@@ -172,16 +227,29 @@ class GreenPowerManager(CreateTaskMixin):
         return time.monotonic() < self._commissioning_window_end
 
     async def permit_join(self, time_s: int) -> None:
-        """Open the GP commissioning window; time_s=0 closes it immediately."""
+        """Open the GP commissioning window; time_s=0 closes it immediately.
+
+        Only the backbone routers are put in commissioning mode, and they report what
+        they hear in unicast, one notification per proxy, which is the census the
+        pairing is chosen from. The coordinator's own radio always listens.
+        """
         if time_s == 0:
             self._commissioning_window_end = 0
             self._pending_devices.clear()
-            await self._send_proxy_commissioning_mode(window=None)
+            self._census.clear()
+
+            for proxy in sorted(self._commissioning_proxies):
+                await self._send_proxy_commissioning_mode(proxy, window=None)
+
+            self._commissioning_proxies.clear()
             return
 
         # Proxies leave commissioning mode on their own once the window expires
         # (A.3.6.3.2), so only an explicit close needs telling them
-        await self._send_proxy_commissioning_mode(window=time_s)
+        for proxy in sorted(self.backbone()):
+            if await self._send_proxy_commissioning_mode(proxy, window=time_s):
+                self._commissioning_proxies.add(proxy)
+
         self._commissioning_window_end = time.monotonic() + time_s
 
     def get_pending_device(self, ieee: t.EUI64) -> GreenPowerDevice | None:
@@ -198,6 +266,16 @@ class GreenPowerManager(CreateTaskMixin):
         if packet.application_id is not ApplicationID.SrcID:
             LOGGER.debug("Ignoring GP packet with unsupported addressing: %r", packet)
             return
+
+        # Every proxy in commissioning mode forwards its own copy of the GPDF, which
+        # is how well it hears the GPD. The copies are duplicates to everything else.
+        if packet.gpp_short_addr is not None and packet.src_id:
+            hearing = self._census.setdefault(packet.src_id, {}).setdefault(
+                packet.gpp_short_addr, ProxyHearing()
+            )
+            hearing.frames += 1
+            hearing.lqi = max(hearing.lqi, packet.lqi or 0)
+            hearing.rssi = max(hearing.rssi, packet.rssi or -128)
 
         if self._dedup_debouncer.filter(
             (packet.src_id, packet.frame_counter),
@@ -303,26 +381,85 @@ class GreenPowerManager(CreateTaskMixin):
         )
 
     async def _finalize_commissioning(self, device: GreenPowerDevice) -> None:
-        """Register a commissioned GPD and pair it with the proxies (A.3.9.1 19)."""
-        if device.ieee in self._application.devices:
-            self._application.gp_device_recommissioned(device)
-            new_device = False
-        else:
-            self._application.listener_event("device_joined", device)
-            self._application.device_initialized(device)
-            new_device = True
+        """Register a commissioned GPD and pair it with its proxies (A.3.9.1 19)."""
+        if device.ieee in self._finalizing:
+            LOGGER.debug("Commissioning of %r is being finalized already", device)
+            return
 
-        await self._application.subscribe_to_multicast_group(
-            derived_group(device), endpoint_id=GP_ENDPOINT
+        self._finalizing.add(device.ieee)
+
+        try:
+            # Let every proxy that heard the GPD deliver its copy
+            await asyncio.sleep(GP_CENSUS_SETTLE)
+            device.proxies = self._select_proxies(device.src_id)
+
+            registered = self._application.devices.get(device.ieee)
+
+            if isinstance(registered, GreenPowerDevice):
+                old_proxies = list(registered.proxies)
+                self._application.gp_device_recommissioned(device)
+                new_device = False
+            else:
+                old_proxies = []
+                self._application.listener_event("device_joined", device)
+                self._application.device_initialized(device)
+                new_device = True
+
+            # Only the first commissioning of a GPD announces its alias (A.3.9.1 19.e)
+            if new_device:
+                await self._send_device_annce(device)
+
+            # The new proxies are paired before the old ones are released
+            for proxy in device.proxies:
+                await self._pair(device, add_sink=True, proxy=proxy)
+
+            for proxy in old_proxies:
+                if proxy not in device.proxies:
+                    await self._pair(device, add_sink=False, proxy=proxy)
+        finally:
+            self._finalizing.discard(device.ieee)
+
+        LOGGER.info(
+            "GP device commissioned: %r with proxies %s", device, device.proxies
         )
 
-        # Only the first commissioning of a GPD announces its alias (A.3.9.1 19.e)
-        if new_device:
-            await self._send_device_annce(device)
+    def _select_proxies(self, src_id: SrcID | None) -> list[t.EUI64]:
+        """The best `GP_PROXIES_PER_DEVICE` proxies that heard the GPD."""
+        assert src_id is not None
 
-        await self.send_pairing(device, add_sink=True)
+        hearings = self._census.pop(src_id, {})
+        proxies: list[t.EUI64] = []
 
-        LOGGER.info("GP device commissioned: %r", device)
+        # Frames heard is the GPD's delivery rate to that proxy, the link fields only
+        # break ties: LQI is rescaled RSSI and says nothing about retries
+        for nwk, hearing in sorted(
+            hearings.items(),
+            key=lambda item: (item[1].frames, item[1].lqi, item[1].rssi),
+            reverse=True,
+        ):
+            try:
+                proxy = self._application.get_device(nwk=nwk)
+            except KeyError:
+                LOGGER.debug("Proxy 0x%04X that heard 0x%08X is unknown", nwk, src_id)
+                continue
+
+            proxies.append(proxy.ieee)
+
+            if len(proxies) == GP_PROXIES_PER_DEVICE:
+                break
+
+        return proxies
+
+    async def _pair(self, device: GreenPowerDevice, *, add_sink: bool, proxy: t.EUI64):
+        try:
+            await self.send_pairing(device, add_sink=add_sink, proxy=proxy)
+        except zigpy.exceptions.DeliveryError:
+            LOGGER.warning(
+                "Failed to %s %r with proxy %s",
+                "pair" if add_sink else "unpair",
+                device,
+                proxy,
+            )
 
     def decommission(self, device: GreenPowerDevice) -> None:
         """Remove a GPD whose Decommissioning command (0xE1) passed its checks."""
@@ -332,20 +469,9 @@ class GreenPowerManager(CreateTaskMixin):
         )
 
     async def unpair(self, device: GreenPowerDevice) -> None:
-        """Remove a GPD from all proxies and leave its derived group, once removed."""
-        await self.send_pairing(device, add_sink=False)
-
-        group = derived_group(device)
-
-        # Distinct GPD IDs can derive the same group
-        if group not in {
-            derived_group(other)
-            for other in self._application.devices.values()
-            if isinstance(other, GreenPowerDevice)
-        }:
-            await self._application.unsubscribe_from_multicast_group(
-                group, endpoint_id=GP_ENDPOINT
-            )
+        """Remove a GPD from its proxies, once removed."""
+        for proxy in device.proxies:
+            await self._pair(device, add_sink=False, proxy=proxy)
 
         LOGGER.info("GP device unpaired: %r", device)
 
@@ -387,26 +513,60 @@ class GreenPowerManager(CreateTaskMixin):
 
     # --- Outgoing GP commands ---
 
-    async def _send_proxy_commissioning_mode(self, window: int | None) -> None:
-        """Broadcast a GP Proxy Commissioning Mode command, to exit if no window."""
-        await self._broadcast_command(
-            GreenPowerProxy.ClientCommandDefs.proxy_commissioning_mode,
-            options=ProxyCommissioningModeOptions(
-                enter=int(window is not None),
-                commissioning_window_present=int(window is not None),
-                # Without it, proxies may ignore the exit command and stay in
-                # commissioning mode until the window expires (Figure 57)
-                exit_mode=ProxyCommissioningModeExitMode.OnExplicitExit,
-                channel_present=0,
-                unicast=0,
-                _reserved=0,
-            ),
-            window=window,
-        )
+    async def _send_proxy_commissioning_mode(
+        self, proxy: t.EUI64, window: int | None
+    ) -> bool:
+        """Tell one proxy to enter commissioning mode, or to exit it if no window."""
+        proxy_device = self._application.devices.get(proxy)
 
-    async def send_pairing(self, device: GreenPowerDevice, add_sink: bool) -> None:
-        """Broadcast a GP Pairing command telling proxies to add or remove a GPD."""
+        if not isinstance(proxy_device, ZigbeeDevice):
+            LOGGER.debug("Proxy %s is not a known device", proxy)
+            return False
+
+        try:
+            await self._unicast_command(
+                proxy_device,
+                GreenPowerProxy.ClientCommandDefs.proxy_commissioning_mode,
+                options=ProxyCommissioningModeOptions(
+                    enter=int(window is not None),
+                    commissioning_window_present=int(window is not None),
+                    # Without it, proxies may ignore the exit command and stay in
+                    # commissioning mode until the window expires (Figure 57)
+                    exit_mode=ProxyCommissioningModeExitMode.OnExplicitExit,
+                    channel_present=0,
+                    # One Commissioning Notification per proxy, without the alias
+                    # that would collapse them into one (A.3.9.1 step 12.e)
+                    unicast=1,
+                    _reserved=0,
+                ),
+                window=window,
+            )
+        except zigpy.exceptions.DeliveryError:
+            LOGGER.warning(
+                "Failed to tell proxy %r to %s commissioning mode",
+                proxy_device,
+                "enter" if window is not None else "exit",
+            )
+            return False
+
+        return True
+
+    async def send_pairing(
+        self, device: GreenPowerDevice, add_sink: bool, *, proxy: t.EUI64
+    ) -> None:
+        """Tell one proxy to forward a GPD's GPDFs to us, or to stop (A.3.3.5.2).
+
+        Lightweight unicast forwarding: the proxy sends each GPDF to this sink alone,
+        so pairing only the proxies that hear the GPD keeps every other proxy's table
+        free, and a proxy that cannot store the pairing says so (A.3.5.2.3).
+        """
         assert device.src_id is not None
+
+        proxy_device = self._application.devices.get(proxy)
+
+        if not isinstance(proxy_device, ZigbeeDevice):
+            LOGGER.warning("Proxy %s of %r is not a known device", proxy, device)
+            return
 
         # The frame counter is the security frame counter of a protected GPD, or the MAC
         # sequence number of an unprotected one if it increments it (A.3.3.5.2)
@@ -416,14 +576,11 @@ class GreenPowerManager(CreateTaskMixin):
             or device.mac_seq_num_capability
         )
 
-        # TODO: proxies forward with derived groupcast, a single NWK broadcast per GPDF.
-        # Unicast forwarding through a chosen set of proxies needs zigpy to maintain
-        # those proxies as the network changes, from its topology scans.
         options = PairingOptions(
             application_id=ApplicationID.SrcID,
             add_sink=int(add_sink),
             remove_gpd=int(not add_sink),
-            communication_mode=CommunicationMode.GroupcastForwardToDGroup,
+            communication_mode=CommunicationMode.UnicastLightweight,
             gpd_fixed=int(device.fixed_location),
             gpd_mac_seq_num_cap=int(device.mac_seq_num_capability),
             security_level=device.security_level,
@@ -441,7 +598,8 @@ class GreenPowerManager(CreateTaskMixin):
         }
 
         if add_sink:
-            schema_kwargs["sink_group"] = derived_group(device)
+            schema_kwargs["sink_ieee"] = self._application.state.node_info.ieee
+            schema_kwargs["sink_nwk_addr"] = self._application.state.node_info.nwk
             schema_kwargs["device_id"] = t.uint8_t(device.device_id)
 
             if frame_counter_present:
@@ -453,12 +611,13 @@ class GreenPowerManager(CreateTaskMixin):
                 # the TC-LK (A.3.7.1.2.3), the GP Pairing is protected by NWK security.
                 schema_kwargs["key"] = device.security_key
 
-        await self._broadcast_command(
-            GreenPowerProxy.ClientCommandDefs.pairing, **schema_kwargs
+        await self._unicast_command(
+            proxy_device, GreenPowerProxy.ClientCommandDefs.pairing, **schema_kwargs
         )
         LOGGER.debug(
-            "Sent GP Pairing for 0x%08X (add_sink=%s)",
+            "Sent GP Pairing for 0x%08X to %r (add_sink=%s)",
             device.src_id,
+            proxy_device,
             add_sink,
         )
 
@@ -582,6 +741,28 @@ class GreenPowerManager(CreateTaskMixin):
         )
 
     # --- Helpers ---
+
+    async def _unicast_command(
+        self, proxy: ZigbeeDevice, command: foundation.ZCLCommandDef, **kwargs: Any
+    ) -> None:
+        """Send a GP cluster command from the sink to one proxy, with an APS ACK."""
+        tsn = self._application.get_sequence()
+        hdr = foundation.ZCLHeader.cluster(
+            tsn=tsn,
+            command_id=command.id,
+            direction=foundation.Direction.Server_to_Client,
+        )
+        request = command.schema(**kwargs)
+
+        await proxy.request(
+            profile=zgp_profile.PROFILE_ID,
+            cluster=GreenPowerProxy.cluster_id,
+            src_ep=GP_ENDPOINT,
+            dst_ep=GP_ENDPOINT,
+            sequence=tsn,
+            data=hdr.serialize() + request.serialize(),
+            expect_reply=False,
+        )
 
     async def _broadcast_command(
         self, command: foundation.ZCLCommandDef, **kwargs: Any

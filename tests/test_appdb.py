@@ -10,6 +10,7 @@ import pytest
 
 from tests.async_mock import AsyncMock, MagicMock, call, patch
 from tests.conftest import (
+    add_initialized_device,
     make_app,
     make_ieee,
     make_node_desc,
@@ -2180,6 +2181,7 @@ GP_SOURCE_ID = SrcID(0x0040F4E4)
             "security_level": SecurityLevel.FullFrameCounterAndMIC,
             "frame_counter": t.uint32_t(99),
             "last_seen": datetime(2026, 10, 14, 12, 0, 0, tzinfo=UTC),
+            "proxies": [make_ieee(1), make_ieee(2)],
         },
     ],
 )
@@ -2187,6 +2189,12 @@ async def test_gp_device_round_trip(tmp_path, attrs):
     """A commissioned GPD is restored with all fields intact."""
     db = tmp_path / "test.db"
     app = await make_app_with_db(db)
+
+    # The proxies are routers the database knows
+    for index in (1, 2):
+        app.device_initialized(
+            add_initialized_device(app, nwk=0x1000 + index, ieee=make_ieee(index))
+        )
 
     device = GreenPowerDevice(
         app, application_id=ApplicationID.SrcID, src_id=GP_SOURCE_ID
@@ -2213,10 +2221,46 @@ async def test_gp_device_round_trip(tmp_path, attrs):
         "security_key_type",
         "security_level",
         "frame_counter",
+        "proxies",
     ):
         assert getattr(restored, name) == getattr(device, name)
 
     await app2.shutdown()
+
+
+async def test_gp_proxies_follow_the_router(tmp_path):
+    """A router removed from the network is no longer a proxy of any GPD."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_db(db)
+
+    routers = [
+        add_initialized_device(app, nwk=0x1000 + index, ieee=make_ieee(index))
+        for index in (1, 2)
+    ]
+
+    for router in routers:
+        app.device_initialized(router)
+
+    device = GreenPowerDevice(
+        app, application_id=ApplicationID.SrcID, src_id=GP_SOURCE_ID
+    )
+    device.security_level = SecurityLevel.NoSecurity
+    device.security_key_type = SecurityKeyType.NoKey
+    device.proxies = [router.ieee for router in routers]
+    app.device_initialized(device)
+
+    await app.remove(routers[0].ieee)
+    await app.shutdown()
+
+    app2 = await make_app_with_db(db)
+    assert app2.devices[device.ieee].proxies == [routers[1].ieee]
+
+    await app2.remove(device.ieee)
+    await app2.shutdown()
+
+    app3 = await make_app_with_db(db)
+    assert device.ieee not in app3.devices
+    await app3.shutdown()
 
 
 async def test_gp_frame_counter_persists_per_press(tmp_path):

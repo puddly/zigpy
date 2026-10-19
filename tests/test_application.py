@@ -37,6 +37,7 @@ from .conftest import (
     make_neighbor_from_device,
     make_node_desc,
 )
+from .zgp.conftest import add_proxy
 
 
 @pytest.fixture
@@ -74,9 +75,9 @@ async def test_permit_broadcast(app):
     app.permit_ncp = AsyncMock()
     app.send_packet = AsyncMock()
     await app.permit(time_s=30)
-    # Two broadcasts: standard Mgmt_Permit_Joining_req plus the GP
-    # ProxyCommissioningMode that opens the GP commissioning window.
-    assert app.send_packet.call_count == 2
+    # One broadcast, the Mgmt_Permit_Joining_req. GP commissioning mode is sent to
+    # the backbone routers alone, of which this network has none
+    assert app.send_packet.call_count == 1
     assert app.permit_ncp.call_count == 1
 
     assert app.send_packet.mock_calls[0].args[0].dst.addr_mode == t.AddrMode.Broadcast
@@ -98,6 +99,8 @@ async def test_permit_opens_gp_window(app, node):
     app.permit_ncp = AsyncMock()
     app.send_packet = AsyncMock()
 
+    proxy = add_proxy(app, nwk=0x1234, ieee=make_ieee(0x50))
+
     await app.permit(time_s=60, node=node)
 
     assert app.green_power.is_commissioning
@@ -108,7 +111,9 @@ async def test_permit_opens_gp_window(app, node):
         if c.args[0].cluster_id == GreenPowerProxy.cluster_id
     ]
     assert len(gp_packets) == 1
-    assert gp_packets[0].dst.addr_mode == t.AddrMode.Broadcast
+    assert gp_packets[0].dst == t.AddrModeAddress(
+        addr_mode=t.AddrMode.NWK, address=proxy.nwk
+    )
 
     await app.green_power.shutdown()
 

@@ -12,13 +12,15 @@ import freezegun
 import pytest
 
 from tests.async_mock import AsyncMock
-from tests.zgp.conftest import wait_for_gp_processing
+from tests.conftest import NCP_IEEE, make_ieee
+from tests.zgp.conftest import PROXY_NWK, add_proxy, wait_for_gp_processing
 from tests.zgp.test_tunneling import (
     COMMISSIONING_NOTIFICATION_ID,
     make_commissioning_options,
     make_tunnel_packet,
 )
 from zigpy.device import GreenPowerDevice
+import zigpy.exceptions
 import zigpy.types as t
 from zigpy.zcl import foundation
 from zigpy.zcl.clusters.greenpower import (
@@ -35,7 +37,6 @@ from zigpy.zgp.commands import (
     GPGenericSwitchConfiguration,
 )
 from zigpy.zgp.crypto import build_gpdf_header, encrypt_payload, encrypt_security_key
-from zigpy.zgp.manager import derived_group
 from zigpy.zgp.types import (
     GP_ENDPOINT,
     ApplicationID,
@@ -66,7 +67,7 @@ def make_gp_packet(
     command_id: GPDCommandID,
     payload: bytes = b"",
     frame_counter: int = 1,
-    gpp_short_addr: int | None = None,
+    gpp_short_addr: int | None = PROXY_NWK,
     rx_after_tx: bool | None = None,
 ) -> t.ZigbeeGpPacket:
     return t.ZigbeeGpPacket(
@@ -135,24 +136,42 @@ async def commission(app, src_id: int, payload: bytes, **kwargs) -> None:
     await wait_for_gp_processing()
 
 
-async def test_permit_join_window(app, manager):
-    """Proxies are told to enter commissioning mode for the window, then to exit."""
+def unicast_to(device) -> t.AddrModeAddress:
+    return t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=device.nwk)
+
+
+async def test_permit_join_window(app, manager, proxy):
+    """Backbone proxies are told to enter commissioning mode, then to exit."""
     await manager.permit_join(time_s=60)
     assert manager.is_commissioning
 
     await manager.permit_join(time_s=0)
     assert not manager.is_commissioning
 
-    enter, exit_ = [
-        sent_command(c.args[0], ProxyCommissioningModeSchema)
-        for c in app.send_packet.mock_calls
-    ]
+    enter_packet, exit_packet = [c.args[0] for c in app.send_packet.mock_calls]
+    assert enter_packet.dst == exit_packet.dst == unicast_to(proxy)
+
+    enter = sent_command(enter_packet, ProxyCommissioningModeSchema)
+    exit_ = sent_command(exit_packet, ProxyCommissioningModeSchema)
 
     assert enter.options.enter
     assert enter.options.exit_mode == ProxyCommissioningModeExitMode.OnExplicitExit
+    # Every proxy reports what it heard, instead of the copies collapsing into one
+    assert enter.options.unicast
     assert enter.window == 60
     assert not exit_.options.enter
     assert exit_.window is None
+
+
+async def test_permit_join_without_backbone(app, manager, proxy):
+    """Without routers, only the coordinator's own radio listens."""
+    app.topology.neighbors.clear()
+    del app.devices[proxy.ieee]
+
+    await manager.permit_join(time_s=60)
+
+    assert manager.is_commissioning
+    assert len(app.send_packet.mock_calls) == 0
 
 
 async def test_permit_join_window_expires(app, manager):
@@ -170,14 +189,20 @@ async def test_permit_join_window_expires(app, manager):
     assert len(app.send_packet.mock_calls) == 0
 
 
-async def test_permit_join_send_failure(app, manager):
-    """The window is not opened if the proxies could not be told about it."""
-    app.send_packet = AsyncMock(side_effect=TimeoutError)
+async def test_permit_join_send_failure(app, manager, proxy, caplog):
+    """A proxy that could not be told still leaves the coordinator listening."""
+    app.send_packet = AsyncMock(side_effect=zigpy.exceptions.DeliveryError("Nope"))
 
-    with pytest.raises(TimeoutError):
-        await manager.permit_join(time_s=60)
+    await manager.permit_join(time_s=60)
 
-    assert not manager.is_commissioning
+    assert manager.is_commissioning
+    assert "Failed to tell proxy" in caplog.text
+
+    # It was never told to enter, so it is not told to exit either
+    app.send_packet = AsyncMock()
+    await manager.permit_join(time_s=0)
+
+    assert len(app.send_packet.mock_calls) == 0
 
 
 async def test_commissioning_window_closed(app, manager):
@@ -302,9 +327,8 @@ async def test_commissioning_rejected(app, manager, src_id, payload):
     assert len(app.send_packet.mock_calls) == 0
 
 
-async def test_commissioning_registers_and_pairs(app, manager):
-    """A new GPD joins, and proxies are paired in derived groupcast mode."""
-    app.subscribe_to_multicast_group = AsyncMock(wraps=app.subscribe_to_multicast_group)
+async def test_commissioning_registers_and_pairs(app, manager, proxy):
+    """A new GPD joins, and the proxy that heard it forwards in lightweight unicast."""
     app.state.network_info.security_level = 5
 
     await manager.permit_join(time_s=60)
@@ -315,16 +339,11 @@ async def test_commissioning_registers_and_pairs(app, manager):
     dev = app.devices[synthetic_ieee(0xAABBCCDD)]
     assert call("device_joined", dev) in app.listener_event.mock_calls
     assert app.device_initialized.mock_calls == [call(dev)]
-
-    # The DGroupID is derived from the GPD ID like the alias (A.3.6.1.4), and the sink
-    # joins it to receive the groupcast GP Notifications
-    group = derive_alias(SrcID(0xAABBCCDD))
-    assert app.subscribe_to_multicast_group.mock_calls == [
-        call(group, endpoint_id=GP_ENDPOINT)
-    ]
+    assert dev.proxies == [proxy.ieee]
 
     # The alias is announced before the proxies are paired (A.3.9.1 19.e-f)
     [annce, packet] = [c.args[0] for c in app.send_packet.mock_calls]
+    alias = derive_alias(SrcID(0xAABBCCDD))
 
     assert annce.cluster_id == zdo_types.ZDOCmd.Device_annce
     assert annce.profile_id == 0
@@ -332,23 +351,96 @@ async def test_commissioning_registers_and_pairs(app, manager):
     assert annce.dst_ep == 0
     assert annce.dst.address == t.BroadcastAddress.RX_ON_WHEN_IDLE
     # Sent as the alias itself, with a fixed sequence number (A.3.6.3.4.2)
-    assert annce.alias_src == group
+    assert annce.alias_src == alias
     assert annce.alias_seq == 0
     assert annce.tsn == 0
     assert annce.data.serialize() == (
-        b"\x00" + group.serialize() + b"\xff" * 8 + bytes([0x40])
+        b"\x00" + alias.serialize() + b"\xff" * 8 + bytes([0x40])
     )
 
+    # The pairing goes to the proxy alone, and names this sink as the destination
+    assert packet.dst == unicast_to(proxy)
     pairing = sent_command(packet, PairingSchema)
 
     assert pairing.options.add_sink
-    assert pairing.options.communication_mode == (
-        CommunicationMode.GroupcastForwardToDGroup
-    )
+    assert pairing.options.communication_mode == CommunicationMode.UnicastLightweight
     assert pairing.gpd_id == 0xAABBCCDD
-    assert pairing.sink_group == group
-    assert pairing.sink_ieee is None
-    assert pairing.sink_nwk_addr is None
+    assert pairing.sink_ieee == NCP_IEEE
+    assert pairing.sink_nwk_addr == 0x0000
+    assert pairing.sink_group is None
+
+
+async def test_commissioning_pairs_best_proxies(app, manager, proxy):
+    """The two proxies that heard the GPD most often and best are paired."""
+    near = add_proxy(app, nwk=0x2222, ieee=make_ieee(0x60))
+    far = add_proxy(app, nwk=0x3333, ieee=make_ieee(0x70))
+
+    await manager.permit_join(time_s=60)
+    app.send_packet.reset_mock()
+
+    # The default proxy hears both commissioning GPDFs, the others only the first
+    for frame_counter in (1, 2):
+        packet = make_gp_packet(
+            0xAABBCCDD, GPDCommandID.CommissioningRequest, b"\x02\x00", frame_counter
+        )
+        app.gp_packet_received(packet)
+
+        if frame_counter == 1:
+            app.gp_packet_received(
+                packet.replace(gpp_short_addr=far.nwk, lqi=t.uint8_t(85))
+            )
+            app.gp_packet_received(
+                packet.replace(gpp_short_addr=near.nwk, lqi=t.uint8_t(255))
+            )
+
+    await wait_for_gp_processing()
+
+    # Frames heard first, then the link quality
+    dev = app.devices[synthetic_ieee(0xAABBCCDD)]
+    assert dev.proxies == [proxy.ieee, near.ieee]
+
+    pairings = [
+        c.args[0]
+        for c in app.send_packet.mock_calls
+        if c.args[0].cluster_id == GreenPowerProxy.cluster_id
+    ]
+    assert [p.dst for p in pairings] == [unicast_to(proxy), unicast_to(near)]
+
+
+async def test_commissioning_unknown_proxy(app, manager):
+    """A proxy zigpy does not know cannot be paired."""
+    await manager.permit_join(time_s=60)
+    app.send_packet.reset_mock()
+
+    await commission(app, 0xAABBCCDD, b"\x02\x00", gpp_short_addr=0x9999)
+
+    dev = app.devices[synthetic_ieee(0xAABBCCDD)]
+    assert dev.proxies == []
+
+    [annce] = [c.args[0] for c in app.send_packet.mock_calls]
+    assert annce.cluster_id == zdo_types.ZDOCmd.Device_annce
+
+
+async def test_recommissioning_switches_proxies(app, manager, proxy):
+    """A re-commissioned GPD is paired with its new proxies before the old are freed."""
+    other = add_proxy(app, nwk=0x2222, ieee=make_ieee(0x60))
+
+    await manager.permit_join(time_s=60)
+    await commission(app, 0xAABBCCDD, b"\x02\x00")
+    assert app.devices[synthetic_ieee(0xAABBCCDD)].proxies == [proxy.ieee]
+    app.send_packet.reset_mock()
+
+    await commission(
+        app, 0xAABBCCDD, b"\x02\x00", frame_counter=2, gpp_short_addr=other.nwk
+    )
+
+    assert app.devices[synthetic_ieee(0xAABBCCDD)].proxies == [other.ieee]
+
+    [added, removed] = [c.args[0] for c in app.send_packet.mock_calls]
+    assert added.dst == unicast_to(other)
+    assert sent_command(added, PairingSchema).options.add_sink
+    assert removed.dst == unicast_to(proxy)
+    assert sent_command(removed, PairingSchema).options.remove_gpd
 
 
 async def test_commissioning_records_link(app, manager):
@@ -474,14 +566,14 @@ async def test_recommissioning_keeps_frame_counter(
     ("options", "rx_after_tx", "gpp_short_addr", "temp_master"),
     [
         # RxAfterTx, tunneled by a proxy
-        (0x82, True, 0x5678, 0x5678),
+        (0x82, True, PROXY_NWK, PROXY_NWK),
         # RxAfterTx, received directly by the coordinator
         (0x82, True, None, 0x0000),
         # RxAfterTx without RxOnCapability still gets a reply (A.3.9.1 13.j)
-        (0x80, True, 0x5678, 0x5678),
+        (0x80, True, PROXY_NWK, PROXY_NWK),
         # RxOnCapability without RxAfterTx: the GPD is not listening
-        (0x82, False, 0x5678, None),
-        (0x80, False, 0x5678, None),
+        (0x82, False, PROXY_NWK, None),
+        (0x80, False, PROXY_NWK, None),
     ],
 )
 async def test_commissioning_reply(
@@ -576,10 +668,8 @@ async def test_commissioning_reply_options(
         (ENCRYPTED_COMMISSIONING, encrypted_success_packet(0x11223344, 8)),
     ],
 )
-async def test_bidirectional_commissioning(app, manager, payload, success):
+async def test_bidirectional_commissioning(app, manager, proxy, payload, success):
     """A GPD listening for a reply is paired once its Success GPDF arrives (A.3.9.1)."""
-    app.subscribe_to_multicast_group = AsyncMock(wraps=app.subscribe_to_multicast_group)
-
     await manager.permit_join(time_s=60)
     app.send_packet.reset_mock()
 
@@ -592,7 +682,6 @@ async def test_bidirectional_commissioning(app, manager, payload, success):
     )
     assert synthetic_ieee(0x11223344) not in app.devices
     assert len(app.device_initialized.mock_calls) == 0
-    assert len(app.subscribe_to_multicast_group.mock_calls) == 0
     app.send_packet.reset_mock()
 
     app.gp_packet_received(success)
@@ -600,11 +689,11 @@ async def test_bidirectional_commissioning(app, manager, payload, success):
 
     dev = app.devices[synthetic_ieee(0x11223344)]
     assert app.device_initialized.mock_calls == [call(dev)]
-    assert app.subscribe_to_multicast_group.mock_calls == [
-        call(derived_group(dev), endpoint_id=GP_ENDPOINT)
-    ]
+    # The proxy that forwarded the commissioning GPDF is the one paired
+    assert dev.proxies == [proxy.ieee]
 
     [_, packet] = [c.args[0] for c in app.send_packet.mock_calls]
+    assert packet.dst == unicast_to(proxy)
     assert sent_command(packet, PairingSchema).options.add_sink
     app.send_packet.reset_mock()
 
@@ -1004,6 +1093,7 @@ async def test_channel_request_invalid(app, manager):
 async def test_decommissioning(
     app,
     manager,
+    proxy,
     frame_counter,
     security_level,
     security_key_type,
@@ -1019,6 +1109,7 @@ async def test_decommissioning(
     dev.security_level = SecurityLevel.FullFrameCounterAndMIC
     dev.security_key_type = SecurityKeyType.IndividualKey
     dev.frame_counter = t.uint32_t(10)
+    dev.proxies = [proxy.ieee]
     app.devices[dev.ieee] = dev
 
     app.gp_packet_received(
@@ -1042,6 +1133,7 @@ async def test_decommissioning(
         return
 
     [packet] = [c.args[0] for c in app.send_packet.mock_calls]
+    assert packet.dst == unicast_to(proxy)
     pairing = sent_command(packet, PairingSchema)
     assert pairing.options.remove_gpd
     assert pairing.gpd_id == 0x12345678
@@ -1057,56 +1149,58 @@ async def test_decommissioning_unknown_device(app, manager):
     assert len(app.send_packet.mock_calls) == 0
 
 
-@pytest.mark.parametrize(
-    ("other_src_id", "unsubscribed"),
-    [
-        # No other GPD uses the group
-        (0x44445555, True),
-        # Another GPD derives the same group
-        (0x33332222, False),
-    ],
-)
-async def test_decommissioning_leaves_derived_group(
-    app, manager, other_src_id, unsubscribed
-):
-    """The sink leaves a derived group once no commissioned GPD uses it."""
-    app.unsubscribe_from_multicast_group = AsyncMock(
-        wraps=app.unsubscribe_from_multicast_group
+async def test_unpair_proxy_gone(app, manager, caplog):
+    """A proxy that left the network cannot be told, the removal continues."""
+    dev = GreenPowerDevice(
+        app, application_id=ApplicationID.SrcID, src_id=SrcID(0x12345678)
     )
+    dev.security_level = SecurityLevel.NoSecurity
+    dev.security_key_type = SecurityKeyType.NoKey
+    dev.proxies = [make_ieee(0x99)]
+    app.devices[dev.ieee] = dev
 
-    for src_id in (0x11112222, other_src_id):
+    await app.remove(dev.ieee)
+
+    assert dev.ieee not in app.devices
+    assert "is not a known device" in caplog.text
+    assert len(app.send_packet.mock_calls) == 0
+
+
+async def test_startup_resends_pairings(app, manager, proxy):
+    """Every GPD's pairings are re-sent to its proxies on startup."""
+    other = add_proxy(app, nwk=0x2222, ieee=make_ieee(0x60))
+
+    for src_id, proxies in (
+        (0x11112222, [proxy.ieee, other.ieee]),
+        (0x33334444, [other.ieee]),
+        (0x55556666, []),
+    ):
         dev = GreenPowerDevice(
             app, application_id=ApplicationID.SrcID, src_id=SrcID(src_id)
         )
+        dev.device_id = DeviceID.OnOffSwitch
         dev.security_level = SecurityLevel.NoSecurity
         dev.security_key_type = SecurityKeyType.NoKey
-        app.devices[dev.ieee] = dev
-
-    manager.decommission(app.devices[synthetic_ieee(0x11112222)])
-    await wait_for_gp_processing()
-
-    assert synthetic_ieee(0x11112222) not in app.devices
-    assert app.unsubscribe_from_multicast_group.mock_calls == (
-        [call(t.Group(0x2222), endpoint_id=GP_ENDPOINT)] if unsubscribed else []
-    )
-
-
-async def test_startup_joins_derived_groups(app, manager):
-    """Every commissioned GPD's derived group is joined once on startup."""
-    app.subscribe_to_multicast_group = AsyncMock(wraps=app.subscribe_to_multicast_group)
-
-    # The first two GPDs derive the same group
-    for src_id in (0x11112222, 0x33332222, 0x44445555):
-        dev = GreenPowerDevice(
-            app, application_id=ApplicationID.SrcID, src_id=SrcID(src_id)
-        )
+        dev.proxies = proxies
         app.devices[dev.ieee] = dev
 
     await manager.startup()
+    await asyncio.gather(
+        *(
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "gp_resend_pairings"
+        )
+    )
 
-    assert app.subscribe_to_multicast_group.mock_calls == [
-        call(t.Group(0x2222), endpoint_id=GP_ENDPOINT),
-        call(t.Group(0x5555), endpoint_id=GP_ENDPOINT),
+    sent = [
+        (packet.dst, sent_command(packet, PairingSchema).gpd_id)
+        for packet in (c.args[0] for c in app.send_packet.mock_calls)
+    ]
+    assert sent == [
+        (unicast_to(proxy), 0x11112222),
+        (unicast_to(other), 0x11112222),
+        (unicast_to(other), 0x33334444),
     ]
 
 
@@ -1133,7 +1227,7 @@ async def test_shutdown(app, manager):
     ],
 )
 async def test_pairing_frame_counter_presence(
-    app, manager, security_level, mac_seq_num_capability, frame_counter
+    app, manager, proxy, security_level, mac_seq_num_capability, frame_counter
 ):
     """The frame counter is only sent if the GPD has one to check (A.3.3.5.2)."""
     dev = GreenPowerDevice(
@@ -1145,7 +1239,7 @@ async def test_pairing_frame_counter_presence(
     dev.security_key_type = SecurityKeyType.NoKey
     dev.frame_counter = t.uint32_t(1234)
 
-    await manager.send_pairing(dev, add_sink=True)
+    await manager.send_pairing(dev, add_sink=True, proxy=proxy.ieee)
 
     pairing = sent_command(app.send_packet.mock_calls[0].args[0], PairingSchema)
 
@@ -1153,7 +1247,7 @@ async def test_pairing_frame_counter_presence(
     assert pairing.frame_counter == frame_counter
 
 
-async def test_pairing_carries_key_in_the_clear(app, manager):
+async def test_pairing_carries_key_in_the_clear(app, manager, proxy):
     """GP Pairing carries the Sink Table key as-is, proxies store it unmodified."""
     dev = GreenPowerDevice(
         app, application_id=ApplicationID.SrcID, src_id=SrcID(0x12345678)
@@ -1164,7 +1258,7 @@ async def test_pairing_carries_key_in_the_clear(app, manager):
     dev.security_key_type = SecurityKeyType.IndividualKey
     dev.frame_counter = t.uint32_t(0)
 
-    await manager.send_pairing(dev, add_sink=True)
+    await manager.send_pairing(dev, add_sink=True, proxy=proxy.ieee)
 
     pairing = sent_command(app.send_packet.mock_calls[0].args[0], PairingSchema)
 
@@ -1196,28 +1290,39 @@ async def pair(app, manager) -> None:
     dev.security_level = SecurityLevel.NoSecurity
     dev.security_key_type = SecurityKeyType.NoKey
 
-    await manager.send_pairing(dev, add_sink=True)
+    await manager.send_pairing(
+        dev, add_sink=True, proxy=app.get_device(nwk=PROXY_NWK).ieee
+    )
+
+
+BROADCAST = t.AddrModeAddress(
+    addr_mode=t.AddrMode.Broadcast, address=t.BroadcastAddress.RX_ON_WHEN_IDLE
+)
+PROXY = t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=PROXY_NWK)
 
 
 @pytest.mark.parametrize(
-    ("send", "command"),
+    ("send", "command", "dst"),
     [
-        (open_window, GreenPowerProxy.ClientCommandDefs.proxy_commissioning_mode),
-        (request_channel, GreenPowerProxy.ClientCommandDefs.response),
+        (
+            open_window,
+            GreenPowerProxy.ClientCommandDefs.proxy_commissioning_mode,
+            PROXY,
+        ),
+        # A GP Response is for the proxies to pick the TempMaster from
+        (request_channel, GreenPowerProxy.ClientCommandDefs.response, BROADCAST),
         # Read client-to-server, 0x01 would be a GP Pairing Search
-        (pair, GreenPowerProxy.ClientCommandDefs.pairing),
+        (pair, GreenPowerProxy.ClientCommandDefs.pairing, PROXY),
     ],
 )
-async def test_commands_sent_server_to_client(app, manager, send, command):
+async def test_commands_sent_server_to_client(app, manager, send, command, dst):
     """The sink is the GP cluster server, so commands to proxies are server-to-client."""
     await send(app, manager)
 
     [packet] = [c.args[0] for c in app.send_packet.mock_calls]
     hdr, _ = foundation.ZCLHeader.deserialize(packet.data.serialize())
 
-    assert packet.dst == t.AddrModeAddress(
-        addr_mode=t.AddrMode.Broadcast, address=t.BroadcastAddress.RX_ON_WHEN_IDLE
-    )
+    assert packet.dst == dst
     assert packet.src_ep == packet.dst_ep == GP_ENDPOINT
     assert hdr.frame_control.frame_type == foundation.FrameType.CLUSTER_COMMAND
     assert hdr.direction == foundation.Direction.Server_to_Client

@@ -275,6 +275,10 @@ class GreenPowerDevice(BaseDevice):
         self.security_level: SecurityLevel | None = None
         self.frame_counter: t.uint32_t | None = None
 
+        # The routers paired as this GPD's proxies, forwarding its GPDFs to us in
+        # lightweight unicast
+        self.proxies: list[t.EUI64] = []
+
     @classmethod
     def from_commissioning(
         cls,

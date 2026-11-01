@@ -27,6 +27,7 @@ import zigpy.exceptions
 import zigpy.group
 import zigpy.profiles
 import zigpy.state
+from zigpy.store import StoreValueDeletedEvent, StoreValueUpdatedEvent
 import zigpy.types as t
 import zigpy.typing
 from zigpy.typing import UNDEFINED
@@ -70,7 +71,7 @@ if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
 
 LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 16
+DB_VERSION = 17
 DB_V = f"_v{DB_VERSION}"
 
 UNIX_EPOCH = datetime.fromtimestamp(0, tz=UTC)
@@ -167,6 +168,15 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         self._worker_task = asyncio.create_task(self._worker())
         self._commit_interval = self._application.config[conf.CONF_DB_COMMIT_INTERVAL]
         self._commit_task: asyncio.Task | None = None
+
+        self._store_unsubscribes = [
+            application.device_stores.on_event(
+                StoreValueUpdatedEvent.event_type, self.on_store_value_updated
+            ),
+            application.device_stores.on_event(
+                StoreValueDeletedEvent.event_type, self.on_store_value_deleted
+            ),
+        ]
 
     async def initialize_tables(self) -> None:
         async with self.execute("PRAGMA integrity_check") as cursor:
@@ -282,6 +292,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
     async def shutdown(self) -> None:
         """Shutdown connection."""
         self.running = False
+
+        for unsubscribe in self._store_unsubscribes:
+            unsubscribe()
+
         await self._callback_handlers.join()
         if not self._worker_task.done():
             self._worker_task.cancel()
@@ -547,6 +561,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             await self._save_attribute_cache(ep)
             await self._save_unsupported_attributes(ep)
         await self._save_ota_query_cache(device)
+        await self._save_device_store(device)
         await self._commit(force=True)
 
     async def _save_endpoints(self, device: Device) -> None:
@@ -860,6 +875,65 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         )
         await self._commit()
 
+    async def _save_device_store(self, device: Device) -> None:
+        rows = [
+            (
+                device.ieee,
+                namespace.name,
+                key,
+                json.dumps(item.value),
+                item.version,
+                item.last_updated.timestamp(),
+            )
+            for namespace in device.store.namespaces()
+            for key, item in namespace.items()
+        ]
+
+        if rows:
+            await self._db.executemany(
+                f"""INSERT INTO device_store{DB_V}
+                        (ieee, namespace, key, value, version, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ieee, namespace, key) DO UPDATE SET
+                        value=excluded.value,
+                        version=excluded.version,
+                        last_updated=excluded.last_updated""",
+                rows,
+            )
+
+    def on_store_value_updated(self, event: StoreValueUpdatedEvent) -> None:
+        self.enqueue("_save_store_value", event)
+
+    async def _save_store_value(self, event: StoreValueUpdatedEvent) -> None:
+        await self.execute(
+            f"""INSERT INTO device_store{DB_V}
+                    (ieee, namespace, key, value, version, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (ieee, namespace, key) DO UPDATE SET
+                    value=excluded.value,
+                    version=excluded.version,
+                    last_updated=excluded.last_updated""",
+            (
+                event.device_ieee,
+                event.namespace,
+                event.key,
+                json.dumps(event.value),
+                event.version,
+                event.last_updated.timestamp(),
+            ),
+        )
+        await self._commit()
+
+    def on_store_value_deleted(self, event: StoreValueDeletedEvent) -> None:
+        self.enqueue("_delete_store_value", event)
+
+    async def _delete_store_value(self, event: StoreValueDeletedEvent) -> None:
+        await self.execute(
+            f"DELETE FROM device_store{DB_V} WHERE ieee = ? AND namespace = ? AND key = ?",
+            (event.device_ieee, event.namespace, event.key),
+        )
+        await self._commit()
+
     def register_gp_device_events(self, device: GreenPowerDevice) -> None:
         device.on_event(
             GreenPowerCommandReceived.event_type, self.on_gp_command_received
@@ -966,6 +1040,10 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         LOGGER.debug("Loading application state")
         await self._load_devices()
         await self._load_gp_devices()
+
+        # Quirks applied below may read from the store
+        await self._load_device_store()
+
         await self._load_node_descriptors()
         await self._load_endpoints()
         await self._load_clusters()
@@ -1366,6 +1444,16 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         cluster.last_query_cmd = cmd
                         break
 
+    async def _load_device_store(self) -> None:
+        async with self.execute(f"SELECT * FROM device_store{DB_V}") as cursor:
+            async for ieee, namespace, key, value, version, last_updated in cursor:
+                self._application.device_stores[ieee].namespace(namespace).restore(
+                    key,
+                    json.loads(value),
+                    version=version,
+                    last_updated=datetime.fromtimestamp(last_updated, UTC),
+                )
+
     async def _load_gp_devices(self) -> None:
         async with self.execute(f"SELECT * FROM gp_devices{DB_V}") as cursor:
             async for (
@@ -1534,6 +1622,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 (self._migrate_to_v14, 14),
                 (self._migrate_to_v15, 15),
                 (self._migrate_to_v16, 16),
+                (self._migrate_to_v17, 17),
             ]:
                 if db_version >= min(to_db_version, DB_VERSION):
                     continue
@@ -2019,3 +2108,24 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             }
         )
         # gp_devices_v16 is new - starts empty
+
+    async def _migrate_to_v17(self) -> None:
+        """Schema v17 adds the device_store table for non-ZCL device state."""
+        await self._migrate_tables(
+            {
+                "devices_v16": "devices_v17",
+                "endpoints_v16": "endpoints_v17",
+                "neighbors_v16": "neighbors_v17",
+                "routes_v16": "routes_v17",
+                "node_descriptors_v16": "node_descriptors_v17",
+                "groups_v16": "groups_v17",
+                "group_members_v16": "group_members_v17",
+                "relays_v16": "relays_v17",
+                "network_backups_v16": "network_backups_v17",
+                "clusters_v16": "clusters_v17",
+                "attributes_cache_v16": "attributes_cache_v17",
+                "ota_query_cache_v16": "ota_query_cache_v17",
+                "gp_devices_v16": "gp_devices_v17",
+            }
+        )
+        # device_store_v17 is new and starts empty
